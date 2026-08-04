@@ -42,7 +42,6 @@ PALETTE = [
     ("#e34948", "#e66767"),  # red
 ]
 OTHER_COLOR = ("#898781", "#898781")  # muted — «Прочее» намеренно неяркое
-MAX_SERIES = len(PALETTE)
 
 def project_name(path: str) -> str:
     """
@@ -83,58 +82,61 @@ def hour_range(first: str, last: str) -> list[str]:
     return out
 
 
-def build_dimension(rows: list[Row], key, hours: list[str], cost_of) -> dict:
+def build_raw(rows: list[Row], hours: list[str], cost_of) -> dict:
     """
-    Свести записи в {серии, матрица час x серия} сразу в двух единицах.
+    Разреженная агрегация по (час, инструмент, модель, агент, проект) —
+    сырьё для клиентской фасетной фильтрации по чекбоксам.
 
-    Порядок серий определяется по СТОИМОСТИ, а не по токенам: модель из подписки
-    может дать миллиарды токенов при нулевой цене, и сортировка по объёму
-    вытолкнула бы наверх то, что ничего не стоит.
+    Схлопывание по этим пяти ключам (не по строкам исходных Row) даёт на
+    порядки меньше записей — дальше группировку по любому одному измерению
+    (с учётом фильтров по остальным) делает JS, а не Python: иначе на клиенте
+    нет данных для пересчёта при комбинированном фильтре вида
+    «инструмент=codex И модель=X».
     """
-    cost_totals: dict[str, float] = defaultdict(float)
-    token_totals: dict[str, int] = defaultdict(int)
-    for r in rows:
-        name = key(r)
-        cost_totals[name] += cost_of(r)
-        token_totals[name] += r.total
-
-    ordered = sorted(
-        token_totals, key=lambda n: (-cost_totals[n], -token_totals[n])
+    dim_values = {dim: sorted({key(r) for r in rows}) for dim, (_, key) in DIMENSIONS.items()}
+    dim_idx = {dim: {v: i for i, v in enumerate(vs)} for dim, vs in dim_values.items()}
+    tools, models, agents, projects = (
+        dim_values["tool"], dim_values["model"], dim_values["agent"], dim_values["project"]
     )
-    top = ordered[:MAX_SERIES]
-    has_other = len(ordered) > MAX_SERIES
-    names = top + (["Прочее"] if has_other else [])
-    index = {name: i for i, name in enumerate(top)}
-    other_i = len(top) if has_other else None
+    hour_idx = {h: i for i, h in enumerate(hours)}
 
-    grid_cost = {h: [0.0] * len(names) for h in hours}
-    grid_tok = {h: [0] * len(names) for h in hours}
+    cells: dict[tuple, list] = {}
     for r in rows:
-        i = index.get(key(r), other_i)
-        if i is None or r.hour not in grid_cost:
-            continue
-        grid_cost[r.hour][i] += cost_of(r)
-        grid_tok[r.hour][i] += r.total
+        key = (
+            hour_idx[r.hour],
+            *(dim_idx[dim][key_fn(r)] for dim, (_, key_fn) in DIMENSIONS.items()),
+        )
+        cell = cells.get(key)
+        if cell is None:
+            cells[key] = [cost_of(r), r.total]
+        else:
+            cell[0] += cost_of(r)
+            cell[1] += r.total
 
-    # Итоги по сериям — из уже посчитанных cost_totals/token_totals, а не повторным
-    # суммированием grid: «Прочее» получает остаток по разности с топ-N.
-    series_cost = [cost_totals[n] for n in top]
-    series_tok = [token_totals[n] for n in top]
-    if has_other:
-        series_cost.append(sum(cost_totals[n] for n in ordered[MAX_SERIES:]))
-        series_tok.append(sum(token_totals[n] for n in ordered[MAX_SERIES:]))
+    # Параллельные плоские массивы вместо списка 5-кортежей на запись —
+    # компактнее в JSON и тривиально разбираются в JS.
+    h_a, t_a, m_a, a_a, p_a, cost_a, tok_a = [], [], [], [], [], [], []
+    for (h, t, m, a, p), (cost, tok) in cells.items():
+        h_a.append(h)
+        t_a.append(t)
+        m_a.append(m)
+        a_a.append(a)
+        p_a.append(p)
+        cost_a.append(round(cost, 6))
+        tok_a.append(tok)
 
     return {
-        "names": names,
-        "grid": {
-            "cost": [[round(v, 6) for v in grid_cost[h]] for h in hours],
-            "tokens": [grid_tok[h] for h in hours],
-        },
-        "totals": {
-            "cost": [round(v, 6) for v in series_cost],
-            "tokens": series_tok,
-        },
-        "otherCount": len(ordered) - MAX_SERIES if has_other else 0,
+        "tools": tools,
+        "models": models,
+        "agents": agents,
+        "projects": projects,
+        "hourIdx": h_a,
+        "toolIdx": t_a,
+        "modelIdx": m_a,
+        "agentIdx": a_a,
+        "projectIdx": p_a,
+        "cost": cost_a,
+        "tokens": tok_a,
     }
 
 
@@ -149,50 +151,18 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
         return rate.cost(r.input, r.output, r.cache_create, r.cache_read, r.cache_create_1h)
 
     # Модели без ставки не считаются бесплатными — их объём выносится отдельно,
-    # чтобы «$0» нельзя было спутать с «цена неизвестна».
+    # чтобы «$0» нельзя было спутать с «цена неизвестна». Это caveat про весь
+    # период целиком, поэтому НЕ пересчитывается на клиенте при фильтрах.
     unpriced_models: dict[str, int] = defaultdict(int)
     for r in rows:
         if r.model not in rates:
             unpriced_models[r.model] += r.total
 
-    cost_hour: dict[str, float] = defaultdict(float)
-    tok_hour: dict[str, int] = defaultdict(int)
-    for r in rows:
-        cost_hour[r.hour] += cost_of(r)
-        tok_hour[r.hour] += r.total
-
-    by_hour = {
-        "cost": [round(cost_hour.get(h, 0.0), 6) for h in hours],
-        "tokens": [tok_hour.get(h, 0) for h in hours],
-    }
-
-    # «Активный час» определяется по расходу токенов: час, в котором работа шла,
-    # но вся она пришлась на модель из подписки, всё равно активен.
-    active_idx = [i for i, v in enumerate(by_hour["tokens"]) if v > 0]
-    n_active = len(active_idx) or 1
-
-    metrics = {}
-    for unit in ("cost", "tokens"):
-        series = by_hour[unit]
-        grand = sum(series)
-        peak = max(series) if series else 0
-        metrics[unit] = {
-            "grand": round(grand, 6) if unit == "cost" else grand,
-            "avgActive": round(grand / n_active, 6) if unit == "cost" else grand // n_active,
-            "avgCalendar": round(grand / len(hours), 6) if unit == "cost" else grand // len(hours),
-            "peak": round(peak, 6) if unit == "cost" else peak,
-            "peakHour": hours[series.index(peak)] if series else "",
-        }
-
     return {
         "hours": hours,
-        "byHour": by_hour,
-        "metrics": metrics,
-        "activeHours": len(active_idx),
-        "calendarHours": len(hours),
         "dateFrom": min(r.date for r in rows),
         "dateTo": max(r.date for r in rows),
-        "records": len(rows),
+        "rawRecords": len(rows),
         "unpriced": {
             "tokens": sum(unpriced_models.values()),
             "models": sorted(unpriced_models, key=lambda m: -unpriced_models[m])[:5],
@@ -201,13 +171,10 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
             {m for m, rt in rates.items() if rt.source == "subscription"}
         ),
         "hasCodex": any(r.tool == "codex" for r in rows),
-        "dimensions": {
-            dim: build_dimension(rows, key, hours, cost_of)
-            for dim, (_, key) in DIMENSIONS.items()
-        },
         "dimLabels": {dim: label for dim, (label, _) in DIMENSIONS.items()},
         "palette": PALETTE,
         "otherColor": OTHER_COLOR,
+        "raw": build_raw(rows, hours, cost_of),
     }
 
 
@@ -272,6 +239,19 @@ TEMPLATE = """<!doctype html>
   .gridline { stroke: var(--grid); stroke-width: 1; }
   .avgline { stroke: var(--ink-2); stroke-width: 2; stroke-dasharray: 5 4; }
   .avglabel { fill: var(--ink-2); font-size: 11px; font-weight: 500; }
+  .pie-title { font-size: 17px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
+  .pie-sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .pie-wrap { display: flex; gap: 48px; align-items: center; justify-content: center; flex-wrap: wrap; }
+  .pie-svg-wrap { position: relative; flex: none; width: 280px; height: 280px; }
+  .pie-slice { stroke: var(--surface); stroke-width: 2; }
+  .pie-total { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; pointer-events: none; }
+  .pie-total .l { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .pie-total .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .pie-slice-label { font-size: 13px; fill: var(--ink-2); text-anchor: middle; pointer-events: none; }
+  .pie-legend { flex: none; display: flex; flex-direction: column; gap: 13px; list-style: none; margin: 0; padding: 0; }
+  .pie-legend li { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--ink); }
+  .pie-legend .name { min-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pie-legend .pct { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 14px; margin-left: auto; padding-left: 24px; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
   th:first-child, td:first-child { text-align: left; }
@@ -288,6 +268,30 @@ TEMPLATE = """<!doctype html>
   .tip b { font-weight: 600; }
   .tip .row { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
   .foot { color: var(--muted); font-size: 12px; margin-top: 18px; }
+  .filters-head { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .filters-title { font-weight: 600; font-size: 14px; }
+  .filters-count { color: var(--muted); font-size: 12px; flex: 1; }
+  #filtersReset { margin-left: auto; }
+  .filter-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+  .filter-group { border: 1px solid var(--grid); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; min-width: 0; }
+  .filter-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .filter-group-head > span:first-child { font-weight: 500; font-size: 13px; flex: 1; }
+  .filter-group-actions button {
+    font-size: 11px; padding: 3px 8px; border-radius: 999px;
+    background: var(--surface); color: var(--ink-2); border: 1px solid var(--axis);
+  }
+  .filter-search {
+    font: inherit; font-size: 12px; padding: 5px 9px; margin-bottom: 8px;
+    background: var(--plane); color: var(--ink); border: 1px solid var(--grid); border-radius: 6px;
+  }
+  .filter-options { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
+  .filter-opt {
+    display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2);
+    padding: 3px 4px; border-radius: 5px; cursor: pointer;
+  }
+  .filter-opt:hover { background: var(--plane); }
+  .filter-opt input { flex: none; }
+  .filter-opt span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -299,10 +303,31 @@ TEMPLATE = """<!doctype html>
   <div class="tile-note" id="caveat" style="margin-top:14px"></div>
 </div>
 
+<div class="card" id="filtersCard">
+  <div class="filters-head">
+    <span class="filters-title">Фильтры</span>
+    <span class="filters-count" id="filterCount"></span>
+    <button id="filtersReset">Сбросить все</button>
+  </div>
+  <div class="filter-groups" id="filterGroups"></div>
+</div>
+
 <div class="card">
   <div class="controls" id="controls"></div>
   <ul class="legend" id="legend"></ul>
   <div class="chart-wrap"><svg id="chart"></svg></div>
+</div>
+
+<div class="card">
+  <h2 class="pie-title" id="pieTitle"></h2>
+  <div class="pie-sub" id="pieSub"></div>
+  <div class="pie-wrap">
+    <div class="pie-svg-wrap">
+      <svg id="pie" viewBox="0 0 200 200"></svg>
+      <div class="pie-total"><div class="l">Итого</div><div class="v" id="pieTotal"></div></div>
+    </div>
+    <ul class="pie-legend" id="pieLegend"></ul>
+  </div>
 </div>
 
 <div class="card">
@@ -338,9 +363,13 @@ const money = n => {
   return '$' + n.toFixed(2).replace('.', ',');
 };
 const hourLabel = h => h.slice(8, 10) + '.' + h.slice(5, 7) + ' ' + h.slice(11) + ':00';
+const escapeHtml = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 let dim = 'tool';
 let unit = 'cost';                       // cost | tokens
+const FILTER_DIMS = ['tool', 'model', 'agent', 'project'];
+const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set() };
 
 const isCost = () => unit === 'cost';
 // Компактная форма для осей и плиток, точная — для таблицы и тултипа
@@ -349,22 +378,113 @@ const exact = v => isCost()
   ? '$' + v.toFixed(2).replace('.', ',')
   : fmtInt(Math.round(v));
 
-function tiles() {
-  const m = DATA.metrics[unit];
+// Индексы агрегированных ячеек DATA.raw, прошедшие фильтр: AND между
+// измерениями (tool И model И agent И project), OR внутри одного измерения
+// (любой отмеченный чекбокс подходит); пустой набор чекбоксов = не ограничивает.
+function filteredIndexes() {
+  const r = DATA.raw, n = r.hourIdx.length, out = [];
+  const active = FILTER_DIMS.filter(k => filters[k].size > 0);
+  outer:
+  for (let i = 0; i < n; i++) {
+    for (const k of active) {
+      if (!filters[k].has(r[k + 's'][r[k + 'Idx'][i]])) continue outer;
+    }
+    out.push(i);
+  }
+  return out;
+}
+
+// Группировка отфильтрованных ячеек по ОДНОМУ измерению (dim) — топ-8 серий
+// по стоимости + «Прочее», та же форма, что раньше строил Python build_dimension.
+function aggregateByDim(idxs, groupDim) {
+  const r = DATA.raw;
+  const names = r[groupDim + 's'], idxArr = r[groupDim + 'Idx'];
+  const costTotals = new Map(), tokTotals = new Map();
+  for (const i of idxs) {
+    const name = names[idxArr[i]];
+    costTotals.set(name, (costTotals.get(name) || 0) + r.cost[i]);
+    tokTotals.set(name, (tokTotals.get(name) || 0) + r.tokens[i]);
+  }
+  const ordered = [...tokTotals.keys()].sort((a, b) =>
+    (costTotals.get(b) - costTotals.get(a)) || (tokTotals.get(b) - tokTotals.get(a)));
+  const MAX_SERIES = DATA.palette.length;
+  const top = ordered.slice(0, MAX_SERIES);
+  const hasOther = ordered.length > MAX_SERIES;
+  const outNames = hasOther ? [...top, 'Прочее'] : top;
+  const index = new Map(top.map((n, i) => [n, i]));
+  const otherI = hasOther ? top.length : null;
+
+  const H = DATA.hours.length, S = outNames.length;
+  const gridCost = Array.from({ length: H }, () => new Array(S).fill(0));
+  const gridTok = Array.from({ length: H }, () => new Array(S).fill(0));
+  for (const i of idxs) {
+    const name = names[idxArr[i]];
+    const si = index.has(name) ? index.get(name) : otherI;
+    if (si == null) continue;
+    const hi = r.hourIdx[i];
+    gridCost[hi][si] += r.cost[i];
+    gridTok[hi][si] += r.tokens[i];
+  }
+
+  const seriesCost = top.map(n => costTotals.get(n));
+  const seriesTok = top.map(n => tokTotals.get(n));
+  if (hasOther) {
+    seriesCost.push(ordered.slice(MAX_SERIES).reduce((s, n) => s + costTotals.get(n), 0));
+    seriesTok.push(ordered.slice(MAX_SERIES).reduce((s, n) => s + tokTotals.get(n), 0));
+  }
+
+  return {
+    names: outNames,
+    grid: { cost: gridCost, tokens: gridTok },
+    totals: { cost: seriesCost, tokens: seriesTok },
+    otherCount: hasOther ? ordered.length - MAX_SERIES : 0,
+  };
+}
+
+// Замена Python metrics/byHour/activeHours/calendarHours — считается из
+// отфильтрованных ячеек, чтобы тайлы пересчитывались вместе с фильтром.
+function computeMetrics(idxs) {
+  const r = DATA.raw, H = DATA.hours.length;
+  const costHour = new Array(H).fill(0), tokHour = new Array(H).fill(0);
+  for (const i of idxs) {
+    costHour[r.hourIdx[i]] += r.cost[i];
+    tokHour[r.hourIdx[i]] += r.tokens[i];
+  }
+  const byHour = { cost: costHour, tokens: tokHour };
+  const activeIdx = [];
+  tokHour.forEach((v, i) => { if (v > 0) activeIdx.push(i); });
+  const nActive = activeIdx.length || 1;
+  const metrics = {};
+  for (const u of ['cost', 'tokens']) {
+    const series = byHour[u];
+    const grand = series.reduce((a, b) => a + b, 0);
+    const peak = series.length ? Math.max(...series) : 0;
+    metrics[u] = {
+      grand, avgActive: grand / nActive, avgCalendar: grand / H,
+      peak, peakHour: series.length && peak > 0 ? DATA.hours[series.indexOf(peak)] : '',
+    };
+  }
+  return { byHour, metrics, activeHours: activeIdx.length, calendarHours: H, records: idxs.length };
+}
+
+function tiles(m) {
+  const mu = m.metrics[unit];
   const what = isCost() ? 'Расход' : 'Токены';
   const items = [
-    [what + ' в среднем за активный час', compact(m.avgActive),
-     DATA.activeHours + ' активных часов из ' + DATA.calendarHours],
-    ['В среднем за календарный час', compact(m.avgCalendar), 'с учётом простоев'],
-    ['Пик за час', compact(m.peak), m.peakHour ? hourLabel(m.peakHour) : ''],
-    [isCost() ? 'Всего' : 'Всего токенов', compact(m.grand),
-     fmtInt(DATA.records) + ' записей'],
+    [what + ' в среднем за активный час', compact(mu.avgActive),
+     m.activeHours + ' активных часов из ' + m.calendarHours],
+    ['В среднем за календарный час', compact(mu.avgCalendar), 'с учётом простоев'],
+    ['Пик за час', compact(mu.peak), mu.peakHour ? hourLabel(mu.peakHour) : ''],
+    [isCost() ? 'Всего' : 'Всего токенов', compact(mu.grand),
+     fmtInt(DATA.rawRecords) + ' записей за период'],
   ];
   document.getElementById('tiles').innerHTML = items.map(([l, v, n]) =>
     `<div><div class="tile-label">${l}</div><div class="tile-value">${v}</div>` +
     `<div class="tile-note">${n}</div></div>`).join('');
 
-  // Что именно не попало в сумму денег — «$0» не должно читаться как «бесплатно»
+  // Что именно не попало в сумму денег — «$0» не должно читаться как «бесплатно».
+  // Это caveat про весь период (не про текущий фильтр) — ставки/подписки не
+  // зависят от того, что сейчас отмечено чекбоксами.
   const parts = [];
   if (DATA.subscription.length)
     parts.push('По подписке (стоимость $0): ' + DATA.subscription.join(', ') + '.');
@@ -392,19 +512,77 @@ function controls() {
     b.onclick = () => { unit = b.dataset.unit; render(); });
 }
 
-function legend() {
-  const d = DATA.dimensions[dim], tot = d.totals[unit];
+function renderFilterGroups() {
+  document.getElementById('filterGroups').innerHTML = FILTER_DIMS.map(k => {
+    const opts = DATA.raw[k + 's'];
+    const label = DATA.dimLabels[k];
+    return `<div class="filter-group" data-dim="${k}">` +
+      `<div class="filter-group-head"><span>${escapeHtml(label)}</span>` +
+      `<span class="filter-group-actions">` +
+      `<button type="button" data-act="all">Все</button>` +
+      `<button type="button" data-act="none">Сброс</button></span></div>` +
+      `<input type="search" class="filter-search" data-dim="${k}" placeholder="Поиск…">` +
+      `<div class="filter-options" data-dim="${k}">` +
+      opts.map(v => `<label class="filter-opt"><input type="checkbox" value="${escapeHtml(v)}">` +
+        `<span title="${escapeHtml(v)}">${escapeHtml(v)}</span></label>`).join('') +
+      `</div></div>`;
+  }).join('');
+
+  const groups = document.getElementById('filterGroups');
+  groups.addEventListener('change', e => {
+    if (e.target.type !== 'checkbox') return;
+    const dimKey = e.target.closest('.filter-group').dataset.dim;
+    if (e.target.checked) filters[dimKey].add(e.target.value);
+    else filters[dimKey].delete(e.target.value);
+    render();
+  });
+  groups.addEventListener('input', e => {
+    if (!e.target.classList.contains('filter-search')) return;
+    const q = e.target.value.trim().toLowerCase();
+    e.target.closest('.filter-group').querySelectorAll('.filter-opt').forEach(el => {
+      el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  });
+  groups.addEventListener('click', e => {
+    const act = e.target.dataset.act;
+    if (!act) return;
+    const group = e.target.closest('.filter-group'), dimKey = group.dataset.dim;
+    group.querySelectorAll('.filter-opt').forEach(el => {
+      if (el.style.display === 'none') return;   // поиск сузил список — не трогаем скрытые
+      const cb = el.querySelector('input');
+      cb.checked = act === 'all';
+      if (act === 'all') filters[dimKey].add(cb.value); else filters[dimKey].delete(cb.value);
+    });
+    render();
+  });
+
+  document.getElementById('filtersReset').onclick = () => {
+    FILTER_DIMS.forEach(k => filters[k].clear());
+    groups.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+    render();
+  };
+}
+
+function updateFilterCount(idxs) {
+  const anyActive = FILTER_DIMS.some(k => filters[k].size > 0);
+  document.getElementById('filterCount').textContent = anyActive
+    ? `показано ${fmtInt(idxs.length)} из ${fmtInt(DATA.raw.cost.length)} агрегированных строк`
+    : '';
+}
+
+function legend(d) {
+  const tot = d.totals[unit];
   // При единственной серии легенда не нужна — её называет заголовок и таблица.
   const shown = d.names.filter((n, i) => tot[i] > 0);
   document.getElementById('legend').innerHTML = shown.length < 2 ? '' :
     d.names.map((n, i) => tot[i] > 0
-      ? `<li><span class="swatch" style="background:${colorAt(i)}"></span>${n}</li>` : '').join('');
+      ? `<li><span class="swatch" style="background:${colorAt(i)}"></span>${escapeHtml(n)}</li>` : '').join('');
 }
 
-function chart() {
-  const d = DATA.dimensions[dim], grid = d.grid[unit];
+function chart(d, m) {
+  const grid = d.grid[unit];
   const hours = DATA.hours;
-  const series = DATA.byHour[unit];
+  const series = m.byHour[unit];
   const bw = hours.length > 400 ? 3 : hours.length > 160 ? 6 : hours.length > 60 ? 11 : 20;
   const gap = bw > 6 ? 2 : 1;               // 2px surface gap; на узких столбиках 1px
   const L = 62, R = 44, T = 12, B = 46, H = 300;   // R с запасом под последнюю подпись оси
@@ -451,8 +629,8 @@ function chart() {
 
   // Линия среднего идёт поверх столбиков, поэтому подпись ставим у правого края
   // и подкладываем плашку цветом поверхности — иначе текст читается по столбикам.
-  const ya = y(DATA.metrics[unit].avgActive);
-  const avgText = `среднее за активный час · ${compact(DATA.metrics[unit].avgActive)}`;
+  const ya = y(m.metrics[unit].avgActive);
+  const avgText = `среднее за активный час · ${compact(m.metrics[unit].avgActive)}`;
   const tw = avgText.length * 5.9 + 10;
   const tx = Math.max(W - R - tw, L + 2);
   s += `<line class="avgline" x1="${L}" x2="${W - R}" y1="${ya}" y2="${ya}"/>` +
@@ -466,15 +644,61 @@ function chart() {
   svg.innerHTML = s;
 }
 
-function table() {
-  const d = DATA.dimensions[dim];
+function pie(d) {
+  const tot = d.totals[unit];
+  const total = tot.reduce((a, b) => a + b, 0);
+  const rows = d.names.map((n, i) => [n, tot[i], i]).filter(r => r[1] > 0);
+  const cx = 100, cy = 100, rOuter = 92, rInner = 54, gap = 1.6;
+
+  document.getElementById('pieTitle').textContent = 'Расходы по измерению «' + DATA.dimLabels[dim] + '»';
+  document.getElementById('pieSub').textContent =
+    `${DATA.dateFrom} – ${DATA.dateTo} · всего ${exact(total)}`;
+  document.getElementById('pieTotal').textContent = compact(total);
+
+  const polar = (r, deg) => {
+    const rad = deg * Math.PI / 180;
+    return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+  };
+  const donutPath = (rO, rI, a0, a1) => {
+    const [x0, y0] = polar(rO, a1), [x1, y1] = polar(rO, a0);
+    const [x2, y2] = polar(rI, a0), [x3, y3] = polar(rI, a1);
+    const large = a1 - a0 <= 180 ? 0 : 1;
+    return `M${x0},${y0} A${rO},${rO} 0 ${large} 0 ${x1},${y1} L${x2},${y2} A${rI},${rI} 0 ${large} 1 ${x3},${y3} Z`;
+  };
+
+  let angle = -90, s = '';
+  rows.forEach(([n, v, i]) => {
+    const sweep = total ? v / total * 360 : 0;
+    const a0 = angle + gap / 2, a1 = angle + sweep - gap / 2;
+    if (a1 > a0) {
+      s += `<path class="pie-slice" d="${donutPath(rOuter, rInner, a0, a1)}" fill="${colorAt(i)}"/>`;
+      if (sweep >= 14) {
+        const [lx, ly] = polar((rOuter + rInner) / 2, (a0 + a1) / 2);
+        const pct = (v / total * 100).toFixed(1).replace('.', ',');
+        s += `<text class="pie-slice-label" x="${lx}" y="${ly + 4}">${pct}%</text>`;
+      }
+    }
+    angle += sweep;
+  });
+  document.getElementById('pie').innerHTML = s;
+
+  document.getElementById('pieLegend').innerHTML = rows
+    .sort((a, b) => b[1] - a[1])
+    .map(([n, v, i]) =>
+      `<li><span class="swatch" style="background:${colorAt(i)}"></span>` +
+      `<span class="name">${escapeHtml(n)}</span>` +
+      `<span class="pct">${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</span></li>`)
+    .join('');
+}
+
+function table(d, m) {
   const main = d.totals[unit], other = d.totals[isCost() ? 'tokens' : 'cost'];
   // Сортируем по выбранной единице, но показываем обе — так видно, что миллиарды
   // токенов из подписки стоят $0, а скромный объём на opus стоит дорого.
   const rows = d.names.map((n, i) => [n, main[i], other[i], i])
     .filter(r => r[1] > 0 || r[2] > 0).sort((a, b) => b[1] - a[1] || b[2] - a[2]);
   const total = main.reduce((a, b) => a + b, 0);
-  const ah = Math.max(DATA.activeHours, 1);
+  const ah = Math.max(m.activeHours, 1);
   const otherLabel = isCost() ? 'Токенов' : 'Стоимость';
   const fmtOther = v => isCost() ? compactTok(v) : '$' + v.toFixed(2).replace('.', ',');
 
@@ -483,7 +707,7 @@ function table() {
     `<th>${isCost() ? 'Стоимость' : 'Всего токенов'}</th><th>Доля</th>` +
     `<th>За активный час</th><th>${otherLabel}</th></tr></thead><tbody>` +
     rows.map(([n, v, o, i]) =>
-      `<tr><td><span class="name-cell"><span class="swatch" style="background:${colorAt(i)}"></span>${n}</span></td>` +
+      `<tr><td><span class="name-cell"><span class="swatch" style="background:${colorAt(i)}"></span>${escapeHtml(n)}</span></td>` +
       `<td>${exact(v)}</td>` +
       `<td>${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</td>` +
       `<td>${exact(v / ah)}</td><td>${fmtOther(o)}</td></tr>`).join('') +
@@ -492,20 +716,21 @@ function table() {
     `<td>${fmtOther(other.reduce((a, b) => a + b, 0))}</td></tr></tfoot>`;
 }
 
+let curD = null, curM = null;
 const tip = document.getElementById('tip');
 document.getElementById('chart').addEventListener('mousemove', e => {
   const t = e.target.closest('rect[data-h]');
-  if (!t) { tip.style.opacity = 0; return; }
-  const hi = +t.dataset.h, d = DATA.dimensions[dim];
+  if (!t || !curD || !curM) { tip.style.opacity = 0; return; }
+  const hi = +t.dataset.h, d = curD, m = curM;
   const cells = d.grid[unit][hi].map((v, i) => [d.names[i], v, i])
     .filter(r => r[1] > 0).sort((a, b) => b[1] - a[1]);
-  const alt = DATA.byHour[isCost() ? 'tokens' : 'cost'][hi];
+  const alt = m.byHour[isCost() ? 'tokens' : 'cost'][hi];
   tip.innerHTML = `<b>${hourLabel(DATA.hours[hi])}</b>` +
-    `<div class="row"><span>всего</span><span>${exact(DATA.byHour[unit][hi])}</span></div>` +
+    `<div class="row"><span>всего</span><span>${exact(m.byHour[unit][hi])}</span></div>` +
     `<div class="row" style="opacity:.65"><span>${isCost() ? 'токенов' : 'стоимость'}</span>` +
     `<span>${isCost() ? compactTok(alt) : '$' + alt.toFixed(2).replace('.', ',')}</span></div>` +
     cells.map(([n, v, i]) =>
-      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${colorAt(i)}"></span> ${n}</span>` +
+      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${colorAt(i)}"></span> ${escapeHtml(n)}</span>` +
       `<span>${exact(v)}</span></div>`).join('');
   tip.style.opacity = 1;
   const r = tip.getBoundingClientRect();
@@ -519,15 +744,21 @@ function render() {
     b.setAttribute('aria-pressed', String(b.dataset.dim === dim)));
   document.querySelectorAll('#controls button[data-unit]').forEach(b =>
     b.setAttribute('aria-pressed', String(b.dataset.unit === unit)));
-  tiles(); legend(); chart(); table();
-  const d = DATA.dimensions[dim];
+
+  const idxs = filteredIndexes();
+  const d = aggregateByDim(idxs, dim);
+  const m = computeMetrics(idxs);
+  curD = d; curM = m;
+
+  tiles(m); legend(d); chart(d, m); pie(d); table(d, m);
+  updateFilterCount(idxs);
   document.getElementById('foot').textContent = d.otherCount
     ? `«Прочее» объединяет ещё ${d.otherCount} значений измерения «${DATA.dimLabels[dim]}».` : '';
 }
 
 document.getElementById('subtitle').textContent =
   `${DATA.dateFrom} — ${DATA.dateTo} · локальное время · источники: Claude Code, Codex`;
-controls(); render();
+controls(); renderFilterGroups(); render();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
 </script>
 </body>
@@ -567,10 +798,14 @@ def main() -> None:
     payload = build_payload(rows, rates)
     out.write_text(render_html(payload), encoding="utf-8")
 
+    raw = payload["raw"]
+    hours_with_data = {raw["hourIdx"][i] for i, tok in enumerate(raw["tokens"]) if tok > 0}
+    total_cost = sum(raw["cost"])
+
     print(f"{out}")
     print(
-        f"записей: {len(rows):,} · активных часов: {payload['activeHours']} · "
-        f"стоимость: ${payload['metrics']['cost']['grand']:,.2f}"
+        f"записей: {len(rows):,} · активных часов: {len(hours_with_data)} · "
+        f"стоимость: ${total_cost:,.2f}"
     )
     if payload["unpriced"]["tokens"]:
         print(
