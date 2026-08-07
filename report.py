@@ -369,7 +369,8 @@ const escapeHtml = s => String(s).replace(/[&<>"']/g, c =>
 
 // Гранулярность оси X графика — по длине периода, чтобы столбики не
 // схлопывались в нечитаемую полосу и не требовали горизонтального скролла.
-// Пороги подобраны так, чтобы число бакетов оставалось в пределах ~90-120.
+// Внутри диапазона DAY число бакетов держится в пределах ~10-90; на переходе
+// DAY→WEEK оно скачком падает (90 дней → ~13 недель) — это ожидаемо, не баг.
 const HOUR = 1, DAY = 24, WEEK = 24 * 7;
 function pickBucketSize(hoursLen) {
   if (hoursLen > DAY * 90) return WEEK;   // дольше ~3 месяцев -> недели
@@ -405,21 +406,22 @@ function bucketizeSeries(hours, series, bucketSize) {
 
 // Схлопывает почасовые hours/grid/series в бакеты по bucketSize последовательных
 // часов. Последний бакет может быть неполным — суммируется по факту наличия данных.
+// outSeries считается через bucketizeSeries — та же граничная арифметика (start/end
+// на bi), один источник истины вместо двух копий цикла.
 function bucketize(hours, grid, series, bucketSize) {
   if (bucketSize === HOUR) return { hours, grid, series };
   const n = Math.ceil(hours.length / bucketSize);
   const S = grid.length ? grid[0].length : 0;
   const outHours = new Array(n);
   const outGrid = Array.from({ length: n }, () => new Array(S).fill(0));
-  const outSeries = new Array(n).fill(0);
   for (let bi = 0; bi < n; bi++) {
     const start = bi * bucketSize, end = Math.min(start + bucketSize, hours.length);
     outHours[bi] = hours[start];
     for (let hi = start; hi < end; hi++) {
       for (let si = 0; si < S; si++) outGrid[bi][si] += grid[hi][si];
-      outSeries[bi] += series[hi];
     }
   }
+  const outSeries = bucketizeSeries(hours, series, bucketSize);
   return { hours: outHours, grid: outGrid, series: outSeries };
 }
 
@@ -639,6 +641,9 @@ function legend(d) {
 function chart(d, m) {
   const bucketSize = pickBucketSize(DATA.hours.length);
   const b = bucketize(DATA.hours, d.grid[unit], m.byHour[unit], bucketSize);
+  // hours ниже — забакеченный массив (длина = число бакетов), для итерации баров/тиков.
+  // DATA.hours — исходный почасовой; их не путать, bucketLabel ниже намеренно берёт
+  // именно DATA.hours (см. её комментарий).
   const { hours, grid, series } = b;
   // тултип берёт агрегированные по бакету данные отсюда, а не из DATA.hours напрямую;
   // altUnit нужен для второй строки тултипа («в токенах»/«в деньгах»). Для alt — только
@@ -660,6 +665,9 @@ function chart(d, m) {
   const minBw = hours.length > 400 ? 2 : hours.length > 160 ? 3 : 4;
   // Независимая переменная — шаг на бакет (bw + gap), а не bw и gap по отдельности:
   // так gap выводится из шага одной формулой, без взаимозависимого подбора.
+  // bw кламплен потолком 20 — при большом step (мало бакетов, широкий контейнер)
+  // фактическая bw+gap может оказаться меньше step, и W (ниже, из факта bw/gap)
+  // тогда меньше avail — это ожидаемо, не переполнение.
   const step = Math.max(minBw + 1, Math.floor(avail / hours.length));
   const gap = step - minBw > 6 ? 2 : 1;
   const bw = Math.max(minBw, Math.min(20, step - gap));
@@ -696,9 +704,9 @@ function chart(d, m) {
 
   // подписи оси X — разрежённые, чтобы не наезжали друг на друга.
   // Последнюю пропускаем, если она не помещается целиком: обрезанный текст хуже отсутствующего.
-  const step = Math.max(1, Math.ceil(hours.length / Math.floor((W - L - R) / 78)));
+  const tickStep = Math.max(1, Math.ceil(hours.length / Math.floor((W - L - R) / 78)));
   hours.forEach((h, hi) => {
-    if (hi % step) return;
+    if (hi % tickStep) return;
     const x = L + hi * (bw + gap) + bw / 2;
     if (x + 36 > W) return;
     s += `<text class="tick" x="${x}" y="${T + H + 18}" text-anchor="middle">${bucketLabel(bucketSize, DATA.hours, hi)}</text>`;
