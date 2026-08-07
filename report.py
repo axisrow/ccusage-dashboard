@@ -386,20 +386,18 @@ function pickBucketSize(hoursLen) {
 // (полночь / понедельник), а не с часом первой записи в данных. Без этого
 // бакет "05.07" мог реально содержать часы 05.07 14:00 — 06.07 13:00, и расход
 // 06.07 размазывался бы по двум бакетам под чужими подписями.
-// Единый инвариант: строим Date первого часа данных, затем прибавляем к нему
-// целые часы, пока не попадём на нужную календарную границу (полночь для DAY,
-// полночь понедельника для WEEK) — а не считаем сдвиг по часу и по дню недели
-// раздельно и не складываем. Возвращаем разницу в часах.
+// allHours — НАИВНАЯ почасовая сетка (Python hour_range: += timedelta(hours=1) без
+// tzinfo) — ровно 24 записи на календарный день независимо от перехода на летнее/
+// зимнее время. Считать offset через мс-арифметику Date (которая DST-зависима в
+// таймзоне браузера) значило бы разъехаться с этой сеткой на переходный час —
+// поэтому ищем границу СКАНИРОВАНИЕМ ИНДЕКСОВ той же сетки, а не через Date.getTime().
 function bucketOffset(allHours, bucketSize) {
   if (bucketSize === HOUR || !allHours.length) return 0;
-  const start = new Date(allHours[0].slice(0, 10) + 'T' + allHours[0].slice(11) + ':00:00');
-  const boundary = new Date(start);
-  boundary.setHours(0, 0, 0, 0);
-  if (boundary.getTime() < start.getTime()) boundary.setDate(boundary.getDate() + 1); // ближайшая полночь вперёд
-  if (bucketSize === WEEK) {
-    while (boundary.getDay() !== 1) boundary.setDate(boundary.getDate() + 1);          // ближайший понедельник
-  }
-  return Math.round((boundary.getTime() - start.getTime()) / 3600000);
+  let i = 0;
+  while (i < allHours.length && allHours[i].slice(11) !== '00') i++;   // первая полночь в сетке
+  if (bucketSize === DAY) return i;
+  while (i < allHours.length && new Date(allHours[i].slice(0, 10) + 'T00:00:00').getDay() !== 1) i += DAY;
+  return i;
 }
 
 // Границы бакета bi (0-based) с учётом календарного сдвига offset (см. bucketOffset).
