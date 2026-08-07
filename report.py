@@ -378,50 +378,88 @@ function pickBucketSize(hoursLen) {
   return HOUR;
 }
 
+// Смещение первого бакета, чтобы границы DAY/WEEK совпадали с календарными
+// (полночь / понедельник), а не с часом первой записи в данных. Без этого
+// бакет "05.07" мог реально содержать часы 05.07 14:00 — 06.07 13:00, и расход
+// 06.07 размазывался бы по двум бакетам под чужими подписями.
+// allHours[0] — локальная почасовая метка "YYYY-MM-DDTHH": час дня — allHours[0].slice(11),
+// день недели берём из неё же через Date (локальная TZ те же сутки, час не важен).
+function bucketOffset(allHours, bucketSize) {
+  if (bucketSize === HOUR || !allHours.length) return 0;
+  const hourOfDay = +allHours[0].slice(11);
+  const toMidnight = (DAY - hourOfDay) % DAY;
+  if (bucketSize === DAY) return toMidnight;
+  // День недели считаем не от исходной даты, а от даты первой полуночи после неё
+  // (toMidnight часов вперёд) — иначе смещение к понедельнику считалось бы от
+  // дня, который к моменту выравнивания по часу уже сменился.
+  const midnightDate = new Date(allHours[0].slice(0, 10) + 'T00:00:00');
+  midnightDate.setDate(midnightDate.getDate() + (toMidnight > 0 ? 1 : 0));
+  const dow = midnightDate.getDay();               // 0=вс..6=сб
+  const daysToMonday = (8 - dow) % 7;               // дней вперёд до ближайшего пн (пн->0)
+  return toMidnight + daysToMonday * DAY;
+}
+
+// Границы бакета bi (0-based) с учётом календарного сдвига offset (см. bucketOffset).
+// Если offset > 0 — бакет 0 частичный, [0, offset); иначе (offset === 0, данные уже
+// начинаются на календарной границе) частичного бакета нет и бакет 0 — сразу полный
+// период [0, bucketSize). Один источник этой формулы для bucketize/bucketizeSeries.
+function bucketBounds(bi, bucketSize, offset, len) {
+  if (offset > 0) {
+    if (bi === 0) return [0, offset];
+    return [offset + (bi - 1) * bucketSize, Math.min(offset + bi * bucketSize, len)];
+  }
+  return [bi * bucketSize, Math.min((bi + 1) * bucketSize, len)];
+}
+
+function bucketCount(bucketSize, offset, len) {
+  return offset > 0 ? 1 + Math.ceil((len - offset) / bucketSize) : Math.ceil(len / bucketSize);
+}
+
 // Подпись бакета: час — как раньше (дата+время), день/неделя — просто дата
 // начала бакета (неделя выводится как диапазон, чтобы было видно охват).
 // allHours — исходный ПОЧАСОВОЙ массив (DATA.hours), не забакеченный, иначе
-// индекс конца недели считается неверно. Начало бакета всегда allHours[bi*bucketSize] —
-// параметр с готовым лейблом часа не нужен, выводим его сами.
-function bucketLabel(bucketSize, allHours, bi) {
-  const start = bi * bucketSize;
+// индекс конца недели считается неверно. Границы — из bucketBounds, тот же
+// источник, что и у bucketize/bucketizeSeries.
+function bucketLabel(bucketSize, allHours, bi, offset) {
+  const [start, end] = bucketBounds(bi, bucketSize, offset, allHours.length);
   if (bucketSize === HOUR) return hourLabel(allHours[start]);
   if (bucketSize === DAY) return dayLabel(allHours[start]);
-  const lastIdx = Math.min(start + WEEK - 1, allHours.length - 1);
-  return dayLabel(allHours[start]) + '–' + dayLabel(allHours[lastIdx]);
+  return dayLabel(allHours[start]) + '–' + dayLabel(allHours[end - 1]);
 }
 
 // Схлопывает один почасовой ряд в бакеты суммированием — используется для
 // «альтернативной» серии тултипа, где нужна только сумма, без разбивки grid.
-function bucketizeSeries(hours, series, bucketSize) {
+function bucketizeSeries(hours, series, bucketSize, offset) {
   if (bucketSize === HOUR) return series;
-  const n = Math.ceil(hours.length / bucketSize);
+  const n = bucketCount(bucketSize, offset, hours.length);
   const out = new Array(n).fill(0);
   for (let bi = 0; bi < n; bi++) {
-    const start = bi * bucketSize, end = Math.min(start + bucketSize, hours.length);
+    const [start, end] = bucketBounds(bi, bucketSize, offset, hours.length);
     for (let hi = start; hi < end; hi++) out[bi] += series[hi];
   }
   return out;
 }
 
 // Схлопывает почасовые hours/grid/series в бакеты по bucketSize последовательных
-// часов. Последний бакет может быть неполным — суммируется по факту наличия данных.
-// outSeries считается через bucketizeSeries — та же граничная арифметика (start/end
-// на bi), один источник истины вместо двух копий цикла.
-function bucketize(hours, grid, series, bucketSize) {
+// часов, выровненных по календарю через offset (см. bucketOffset и bucketBounds).
+// Первый бакет может быть короче bucketSize (обрезан началом данных), последний —
+// неполным по факту наличия данных. Границы бакета — из bucketBounds (один источник
+// формулы для bucketize/bucketizeSeries/bucketLabel), outSeries — вызовом
+// bucketizeSeries, не пересчитывается здесь заново.
+function bucketize(hours, grid, series, bucketSize, offset) {
   if (bucketSize === HOUR) return { hours, grid, series };
-  const n = Math.ceil(hours.length / bucketSize);
+  const n = bucketCount(bucketSize, offset, hours.length);
   const S = grid.length ? grid[0].length : 0;
   const outHours = new Array(n);
   const outGrid = Array.from({ length: n }, () => new Array(S).fill(0));
   for (let bi = 0; bi < n; bi++) {
-    const start = bi * bucketSize, end = Math.min(start + bucketSize, hours.length);
+    const [start, end] = bucketBounds(bi, bucketSize, offset, hours.length);
     outHours[bi] = hours[start];
     for (let hi = start; hi < end; hi++) {
       for (let si = 0; si < S; si++) outGrid[bi][si] += grid[hi][si];
     }
   }
-  const outSeries = bucketizeSeries(hours, series, bucketSize);
+  const outSeries = bucketizeSeries(hours, series, bucketSize, offset);
   return { hours: outHours, grid: outGrid, series: outSeries };
 }
 
@@ -640,7 +678,8 @@ function legend(d) {
 
 function chart(d, m) {
   const bucketSize = pickBucketSize(DATA.hours.length);
-  const b = bucketize(DATA.hours, d.grid[unit], m.byHour[unit], bucketSize);
+  const offset = bucketOffset(DATA.hours, bucketSize);
+  const b = bucketize(DATA.hours, d.grid[unit], m.byHour[unit], bucketSize, offset);
   // hours ниже — забакеченный массив (длина = число бакетов), для итерации баров/тиков.
   // DATA.hours — исходный почасовой; их не путать, bucketLabel ниже намеренно берёт
   // именно DATA.hours (см. её комментарий).
@@ -650,8 +689,8 @@ function chart(d, m) {
   // сумма, полный grid не нужен, поэтому bucketizeSeries вместо bucketize (не тратим
   // O(hours*S) на agregацию неиспользуемой разбивки по сериям).
   const altUnit = isCost() ? 'tokens' : 'cost';
-  const altSeries = bucketizeSeries(DATA.hours, m.byHour[altUnit], bucketSize);
-  curBucket = { hours, grid, series, altSeries, names: d.names, bucketSize };
+  const altSeries = bucketizeSeries(DATA.hours, m.byHour[altUnit], bucketSize, offset);
+  curBucket = { hours, grid, series, altSeries, names: d.names, bucketSize, offset };
   const L = 62, R = 44, T = 12, B = 46, H = 300;   // R с запасом под последнюю подпись оси
 
   // Ширина столбика — от реальной ширины контейнера, а не от фиксированных
@@ -709,13 +748,25 @@ function chart(d, m) {
     if (hi % tickStep) return;
     const x = L + hi * (bw + gap) + bw / 2;
     if (x + 36 > W) return;
-    s += `<text class="tick" x="${x}" y="${T + H + 18}" text-anchor="middle">${bucketLabel(bucketSize, DATA.hours, hi)}</text>`;
+    s += `<text class="tick" x="${x}" y="${T + H + 18}" text-anchor="middle">${bucketLabel(bucketSize, DATA.hours, hi, offset)}</text>`;
   });
 
   // Линия среднего идёт поверх столбиков, поэтому подпись ставим у правого края
   // и подкладываем плашку цветом поверхности — иначе текст читается по столбикам.
-  const ya = y(m.metrics[unit].avgActive);
-  const avgText = `среднее за активный час · ${compact(m.metrics[unit].avgActive)}`;
+  // avgActive — среднее ЗА ЧАС, столбики при DAY/WEEK — суммы за бакет (24/168 часов):
+  // на одной оси с ними почасовое среднее легло бы почти на дно графика, как будто
+  // расход нулевой. Поэтому при бакетинге считаем среднее по самим бакетам (той же
+  // размерности, что и столбики), а не пересчитываем avgActive обратно в часы —
+  // средний размер активного бакета (последний может быть неполным) не совпадает
+  // с bucketSize, так что домножение на bucketSize было бы неточным.
+  const activeBuckets = series.filter(v => v > 0);
+  const avgY = bucketSize === HOUR
+    ? m.metrics[unit].avgActive
+    : activeBuckets.length ? activeBuckets.reduce((a, v) => a + v, 0) / activeBuckets.length : 0;
+  const avgLabel = bucketSize === HOUR ? 'среднее за активный час'
+    : bucketSize === DAY ? 'среднее за активный день' : 'среднее за активную неделю';
+  const ya = y(avgY);
+  const avgText = `${avgLabel} · ${compact(avgY)}`;
   const tw = avgText.length * 5.9 + 10;
   const tx = Math.max(W - R - tw, L + 2);
   s += `<line class="avgline" x1="${L}" x2="${W - R}" y1="${ya}" y2="${ya}"/>` +
@@ -810,7 +861,7 @@ document.getElementById('chart').addEventListener('mousemove', e => {
   const cells = b.grid[hi].map((v, i) => [b.names[i], v, i])
     .filter(r => r[1] > 0).sort((a, b) => b[1] - a[1]);
   const alt = b.altSeries[hi];
-  tip.innerHTML = `<b>${bucketLabel(b.bucketSize, DATA.hours, hi)}</b>` +
+  tip.innerHTML = `<b>${bucketLabel(b.bucketSize, DATA.hours, hi, b.offset)}</b>` +
     `<div class="row"><span>всего</span><span>${exact(b.series[hi])}</span></div>` +
     `<div class="row" style="opacity:.65"><span>${isCost() ? 'токенов' : 'стоимость'}</span>` +
     `<span>${isCost() ? compactTok(alt) : '$' + alt.toFixed(2).replace('.', ',')}</span></div>` +
