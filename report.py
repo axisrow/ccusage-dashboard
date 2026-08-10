@@ -28,6 +28,16 @@ from pathlib import Path
 
 from parse import Row, collect, normalize_date
 from pricing import load as load_rates
+from pricing import split_cache_create
+
+# Порядок компонентов расхода — единственный источник истины для build_raw
+# (Python) и COMP_KEYS/COMP_COST_KEYS в TEMPLATE (JS); менять только вместе.
+COMPONENT_KEYS = ("in", "out", "cc5m", "cc1h", "cr")
+
+
+def cost_key(component: str) -> str:
+    """Имя денежного ключа в payload["raw"] для компонента ("in" -> "costIn")."""
+    return f"cost{component[0].upper()}{component[1:]}"
 
 # Валидированная палитра: слот -> (light, dark). Порядок фиксирован и не тасуется —
 # именно он обеспечивает CVD-разделение соседних серий.
@@ -82,7 +92,7 @@ def hour_range(first: str, last: str) -> list[str]:
     return out
 
 
-def build_raw(rows: list[Row], hours: list[str], cost_of) -> dict:
+def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     """
     Разреженная агрегация по (час, инструмент, модель, агент, проект) —
     сырьё для клиентской фасетной фильтрации по чекбоксам.
@@ -92,6 +102,12 @@ def build_raw(rows: list[Row], hours: list[str], cost_of) -> dict:
     (с учётом фильтров по остальным) делает JS, а не Python: иначе на клиенте
     нет данных для пересчёта при комбинированном фильтре вида
     «инструмент=codex И модель=X».
+
+    Каждая ячейка несёт разбивку по 5 компонентам (in, out, cc5m, cc1h, cr) —
+    в токенах и в деньгах — чтобы клиентская фасетная фильтрация пересчитывала
+    разбивку при фильтрах. Итоговые cost/tokens ячейки — сумма её компонентов,
+    выводится на JS-стороне (см. cellCost/cellTok в TEMPLATE), а не хранится
+    здесь отдельным полем.
     """
     dim_values = {dim: sorted({key(r) for r in rows}) for dim, (_, key) in DIMENSIONS.items()}
     dim_idx = {dim: {v: i for i, v in enumerate(vs)} for dim, vs in dim_values.items()}
@@ -100,30 +116,39 @@ def build_raw(rows: list[Row], hours: list[str], cost_of) -> dict:
     )
     hour_idx = {h: i for i, h in enumerate(hours)}
 
+    # cell = [(5 токен-компонентов), (5 денежных компонентов)] — единый источник
+    # порядка компонентов с Rates.cost_components/components_of (in, out, cc5m,
+    # cc1h, cr), без отдельного магического смещения по индексам.
     cells: dict[tuple, list] = {}
     for r in rows:
         key = (
             hour_idx[r.hour],
             *(dim_idx[dim][key_fn(r)] for dim, (_, key_fn) in DIMENSIONS.items()),
         )
+        tok_comp, cost_comp = components_of(r)
         cell = cells.get(key)
         if cell is None:
-            cells[key] = [cost_of(r), r.total]
+            cells[key] = [list(tok_comp), list(cost_comp)]
         else:
-            cell[0] += cost_of(r)
-            cell[1] += r.total
+            tc, cc = cell
+            for i in range(5):
+                tc[i] += tok_comp[i]
+                cc[i] += cost_comp[i]
 
-    # Параллельные плоские массивы вместо списка 5-кортежей на запись —
-    # компактнее в JSON и тривиально разбираются в JS.
-    h_a, t_a, m_a, a_a, p_a, cost_a, tok_a = [], [], [], [], [], [], []
-    for (h, t, m, a, p), (cost, tok) in cells.items():
+    # Параллельные плоские массивы вместо списка кортежей на запись — компактнее
+    # в JSON и тривиально разбираются в JS.
+    h_a, t_a, m_a, a_a, p_a = [], [], [], [], []
+    tok_arrs = {k: [] for k in COMPONENT_KEYS}
+    cost_arrs = {k: [] for k in COMPONENT_KEYS}
+    for (h, t, m, a, p), (tok_comp, cost_comp) in cells.items():
         h_a.append(h)
         t_a.append(t)
         m_a.append(m)
         a_a.append(a)
         p_a.append(p)
-        cost_a.append(round(cost, 6))
-        tok_a.append(tok)
+        for k, tok_v, cost_v in zip(COMPONENT_KEYS, tok_comp, cost_comp):
+            tok_arrs[k].append(tok_v)
+            cost_arrs[k].append(round(cost_v, 6))
 
     return {
         "tools": tools,
@@ -135,8 +160,8 @@ def build_raw(rows: list[Row], hours: list[str], cost_of) -> dict:
         "modelIdx": m_a,
         "agentIdx": a_a,
         "projectIdx": p_a,
-        "cost": cost_a,
-        "tokens": tok_a,
+        **tok_arrs,
+        **{cost_key(k): v for k, v in cost_arrs.items()},
     }
 
 
@@ -144,11 +169,19 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
     hours_present = sorted({r.hour for r in rows})
     hours = hour_range(hours_present[0], hours_present[-1])
 
-    def cost_of(r: Row) -> float:
+    def components_of(r: Row) -> tuple[tuple[int, ...], tuple[float, ...]]:
+        """Токен- и денежные компоненты записи (in, out, cc5m, cc1h, cr) —
+        split_cache_create делит cache_create на 5m/1h один раз, дальше токены
+        идут как есть, а деньги — через Rates.cost_components (там та же
+        split_cache_create). Без ставки — токены настоящие, деньги нули."""
+        cc5m, cc1h = split_cache_create(r.cache_create, r.cache_create_1h)
+        tok_comp = (r.input, r.output, cc5m, cc1h, r.cache_read)
         rate = rates.get(r.model)
-        if rate is None:
-            return 0.0
-        return rate.cost(r.input, r.output, r.cache_create, r.cache_read, r.cache_create_1h)
+        cost_comp = (
+            rate.cost_components(r.input, r.output, r.cache_create, r.cache_read, r.cache_create_1h)
+            if rate is not None else (0.0, 0.0, 0.0, 0.0, 0.0)
+        )
+        return tok_comp, cost_comp
 
     # Модели без ставки не считаются бесплатными — их объём выносится отдельно,
     # чтобы «$0» нельзя было спутать с «цена неизвестна». Это caveat про весь
@@ -174,7 +207,10 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
         "dimLabels": {dim: label for dim, (label, _) in DIMENSIONS.items()},
         "palette": PALETTE,
         "otherColor": OTHER_COLOR,
-        "raw": build_raw(rows, hours, cost_of),
+        # Ставки по компонентам для показа в таблице (Rates.as_dict — те же поля).
+        "rates": {m: rt.as_dict() for m, rt in rates.items()},
+        "componentPalette": PALETTE[:5],
+        "raw": build_raw(rows, hours, components_of),
     }
 
 
@@ -252,6 +288,7 @@ TEMPLATE = """<!doctype html>
   .pie-legend li { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--ink); }
   .pie-legend .name { min-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pie-legend .pct { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 14px; margin-left: auto; padding-left: 24px; }
+  .table-wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
   th:first-child, td:first-child { text-align: left; }
@@ -259,6 +296,10 @@ TEMPLATE = """<!doctype html>
   td { font-variant-numeric: tabular-nums; }
   .name-cell { display: flex; align-items: center; gap: 8px; }
   tfoot td { font-weight: 600; border-bottom: none; }
+  /* Ячейка компонента: стоимость сверху, токены снизу мелко и приглушённо */
+  .comp-cost { font-variant-numeric: tabular-nums; }
+  .comp-tok { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .rate-cell { white-space: nowrap; }
   .tip {
     position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
     background: var(--ink); color: var(--surface); padding: 8px 11px;
@@ -331,7 +372,7 @@ TEMPLATE = """<!doctype html>
 </div>
 
 <div class="card">
-  <table id="table"></table>
+  <div class="table-wrap"><table id="table"></table></div>
 </div>
 
 <div class="foot" id="foot"></div>
@@ -466,17 +507,46 @@ function bucketize(hours, grid, series, bucketSize, offset) {
   return { hours: outHours, grid: outGrid, series: outSeries };
 }
 
-let dim = 'tool';
+let dim = 'tool';                        // tool | model | agent | project | components
 let unit = 'cost';                       // cost | tokens
 const FILTER_DIMS = ['tool', 'model', 'agent', 'project'];
-const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set() };
+const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set(), components: new Set() };
+
+// «Компоненты» — отдельное измерение (серии = 5 компонентов расхода), а не
+// переключатель стека: выбор «Компоненты» заменяет Инструмент/Модель/Агент/Проект.
+const COMP_DIM_LABEL = 'Компоненты';
+// Компоненты расхода: ключи в DATA.raw, подписи и цвета. cache_create_1h (TTL 1h)
+// тарифицируется дороже 5m, поэтому хранится отдельно, но в таблице «Кэш-запись»
+// объединяет cc5m+cc1h (см. comp4 в table()).
+const COMP_KEYS = ['in', 'out', 'cc5m', 'cc1h', 'cr'];
+const COMP_COST_KEYS = ['costIn', 'costOut', 'costCc5m', 'costCc1h', 'costCr'];
+const COMP_LABELS = ['Вход', 'Выход', 'Кэш-запись 5м', 'Кэш-запись 1ч', 'Кэш-чтение'];
+
+// DATA.raw не везёт готовую сумму (cost/tokens) по ячейке — она выводима из 5
+// компонентов, и хранить её ещё раз в JSON было бы избыточно. Сумма считается
+// один раз здесь (не в build_raw и не при каждом render()), чтобы частый случай
+// «фильтр компонентов не задан» в cellCost/cellTok не пересчитывал reduce по 5
+// массивам на каждую ячейку при каждом клике по фильтру.
+DATA.raw.cost = DATA.raw.costIn.map((_, i) =>
+  COMP_COST_KEYS.reduce((s, k) => s + DATA.raw[k][i], 0));
+DATA.raw.tokens = DATA.raw.in.map((_, i) =>
+  COMP_KEYS.reduce((s, k) => s + DATA.raw[k][i], 0));
+const compColorAt = i => {
+  const p = i < DATA.componentPalette.length ? DATA.componentPalette[i] : DATA.otherColor;
+  return dark() ? p[1] : p[0];
+};
+// Цвет серии: для измерения «Компоненты» — палитра компонентов, иначе — серийная.
+const seriesColorAt = i => dim === 'components' ? compColorAt(i) : colorAt(i);
+const dimLabel = d => DATA.dimLabels[d] || COMP_DIM_LABEL;
 
 const isCost = () => unit === 'cost';
 // Компактная форма для осей и плиток, точная — для таблицы и тултипа
 const compact = v => isCost() ? money(v) : compactTok(v);
-const exact = v => isCost()
-  ? '$' + v.toFixed(2).replace('.', ',')
-  : fmtInt(Math.round(v));
+// Точная денежная форма независимо от текущего unit — используется и exact()
+// (когда unit === 'cost'), и местами, которым нужны именно доллары (таблица
+// компонентов/ставок, тултип), поэтому вынесена отдельно, а не продублирована.
+const money2 = v => '$' + v.toFixed(2).replace('.', ',');
+const exact = v => isCost() ? money2(v) : fmtInt(Math.round(v));
 
 // Индексы агрегированных ячеек DATA.raw, прошедшие фильтр: AND между
 // измерениями (tool И model И agent И project), OR внутри одного измерения
@@ -484,6 +554,10 @@ const exact = v => isCost()
 function filteredIndexes() {
   const r = DATA.raw, n = r.hourIdx.length, out = [];
   const active = FILTER_DIMS.filter(k => filters[k].size > 0);
+  // Фильтр по компонентам НЕ отбирает ячейки — у каждой ячейки всегда все 5
+  // компонентов сразу, поэтому отбор по «ненулевой компонент» затаскивал бы в
+  // сумму и остальные 4 компонента той же ячейки. Компоненты — это маска
+  // слагаемых при суммировании (см. activeComps/cellCost/cellTok), а не фильтр строк.
   outer:
   for (let i = 0; i < n; i++) {
     for (const k of active) {
@@ -494,17 +568,66 @@ function filteredIndexes() {
   return out;
 }
 
+// Индексы компонентов (0..4), участвующих в сумме. Пустой чекбокс-набор = все 5
+// (как «фильтр не задан»). Используется вместе с cellCost/cellTok, чтобы везде,
+// где раньше суммировался r.cost[i]/r.tokens[i] целиком, суммировалась только
+// выбранная часть компонентов.
+const ALL_COMPS = [...COMP_KEYS.keys()];
+const activeComps = () => filters.components.size
+  ? ALL_COMPS.filter(i => filters.components.has(COMP_KEYS[i]))
+  : ALL_COMPS;
+// Частый случай — фильтр компонентов не задан (comps === ALL_COMPS) — читает
+// готовую сумму DATA.raw.cost/tokens (посчитана один раз при загрузке, см. выше)
+// вместо reduce по 5 массивам на каждой ячейке при каждом render().
+const cellCost = (i, comps) => comps === ALL_COMPS
+  ? DATA.raw.cost[i]
+  : comps.reduce((s, k) => s + DATA.raw[COMP_COST_KEYS[k]][i], 0);
+const cellTok = (i, comps) => comps === ALL_COMPS
+  ? DATA.raw.tokens[i]
+  : comps.reduce((s, k) => s + DATA.raw[COMP_KEYS[k]][i], 0);
+
 // Группировка отфильтрованных ячеек по ОДНОМУ измерению (dim) — топ-8 серий
 // по стоимости + «Прочее», та же форма, что раньше строил Python build_dimension.
+// Для dim === 'components' серии — это 5 компонентов расхода (без «Прочее»).
 function aggregateByDim(idxs, groupDim) {
   const r = DATA.raw;
-  const names = r[groupDim + 's'], idxArr = r[groupDim + 'Idx'];
-  const costTotals = new Map(), tokTotals = new Map();
-  for (const i of idxs) {
-    const name = names[idxArr[i]];
-    costTotals.set(name, (costTotals.get(name) || 0) + r.cost[i]);
-    tokTotals.set(name, (tokTotals.get(name) || 0) + r.tokens[i]);
+  const H = DATA.hours.length;
+  const comps = activeComps();
+
+  if (groupDim === 'components') {
+    const gridCost = Array.from({ length: H }, () => new Array(5).fill(0));
+    const gridTok = Array.from({ length: H }, () => new Array(5).fill(0));
+    const totals = { cost: new Array(5).fill(0), tokens: new Array(5).fill(0) };
+    for (const i of idxs) {
+      const hi = r.hourIdx[i];
+      for (const k of comps) {
+        gridCost[hi][k] += r[COMP_COST_KEYS[k]][i];
+        gridTok[hi][k] += r[COMP_KEYS[k]][i];
+        totals.cost[k] += r[COMP_COST_KEYS[k]][i];
+        totals.tokens[k] += r[COMP_KEYS[k]][i];
+      }
+    }
+    return {
+      names: COMP_LABELS,
+      grid: { cost: gridCost, tokens: gridTok },
+      totals,
+      compTok: null, compCost: null,
+      otherCount: 0,
+    };
   }
+
+  const names = r[groupDim + 's'], idxArr = r[groupDim + 'Idx'];
+  // cellCost/cellTok посчитаны по каждому idx один раз и переиспользуются в обоих
+  // проходах ниже (ранжирование top-N и заполнение сеток) — иначе reduce по
+  // компонентам считался бы дважды на строку.
+  const costs = idxs.map(i => cellCost(i, comps));
+  const toks = idxs.map(i => cellTok(i, comps));
+  const costTotals = new Map(), tokTotals = new Map();
+  idxs.forEach((i, j) => {
+    const name = names[idxArr[i]];
+    costTotals.set(name, (costTotals.get(name) || 0) + costs[j]);
+    tokTotals.set(name, (tokTotals.get(name) || 0) + toks[j]);
+  });
   const ordered = [...tokTotals.keys()].sort((a, b) =>
     (costTotals.get(b) - costTotals.get(a)) || (tokTotals.get(b) - tokTotals.get(a)));
   const MAX_SERIES = DATA.palette.length;
@@ -514,17 +637,27 @@ function aggregateByDim(idxs, groupDim) {
   const index = new Map(top.map((n, i) => [n, i]));
   const otherI = hasOther ? top.length : null;
 
-  const H = DATA.hours.length, S = outNames.length;
+  const S = outNames.length;
   const gridCost = Array.from({ length: H }, () => new Array(S).fill(0));
   const gridTok = Array.from({ length: H }, () => new Array(S).fill(0));
-  for (const i of idxs) {
+  // Разбивка по 5 компонентам по сериям — для столбцов компонентов в таблице.
+  // Невыбранные компоненты остаются нулями, чтобы колонки таблицы (см. table())
+  // не расходились с итоговой стоимостью/токенами серии при активном фильтре.
+  const compTok = Array.from({ length: S }, () => new Array(5).fill(0));
+  const compCost = Array.from({ length: S }, () => new Array(5).fill(0));
+  idxs.forEach((i, j) => {
     const name = names[idxArr[i]];
     const si = index.has(name) ? index.get(name) : otherI;
-    if (si == null) continue;
+    if (si == null) return;
     const hi = r.hourIdx[i];
-    gridCost[hi][si] += r.cost[i];
-    gridTok[hi][si] += r.tokens[i];
-  }
+    const c = costs[j], t = toks[j];
+    gridCost[hi][si] += c;
+    gridTok[hi][si] += t;
+    for (const k of comps) {
+      compTok[si][k] += r[COMP_KEYS[k]][i];
+      compCost[si][k] += r[COMP_COST_KEYS[k]][i];
+    }
+  });
 
   const seriesCost = top.map(n => costTotals.get(n));
   const seriesTok = top.map(n => tokTotals.get(n));
@@ -537,6 +670,7 @@ function aggregateByDim(idxs, groupDim) {
     names: outNames,
     grid: { cost: gridCost, tokens: gridTok },
     totals: { cost: seriesCost, tokens: seriesTok },
+    compTok, compCost,
     otherCount: hasOther ? ordered.length - MAX_SERIES : 0,
   };
 }
@@ -545,10 +679,11 @@ function aggregateByDim(idxs, groupDim) {
 // отфильтрованных ячеек, чтобы тайлы пересчитывались вместе с фильтром.
 function computeMetrics(idxs) {
   const r = DATA.raw, H = DATA.hours.length;
+  const comps = activeComps();
   const costHour = new Array(H).fill(0), tokHour = new Array(H).fill(0);
   for (const i of idxs) {
-    costHour[r.hourIdx[i]] += r.cost[i];
-    tokHour[r.hourIdx[i]] += r.tokens[i];
+    costHour[r.hourIdx[i]] += cellCost(i, comps);
+    tokHour[r.hourIdx[i]] += cellTok(i, comps);
   }
   const byHour = { cost: costHour, tokens: tokHour };
   const activeIdx = [];
@@ -602,6 +737,7 @@ function controls() {
     '<span style="color:var(--muted);font-size:12px">Разбивка:</span>' +
     Object.entries(DATA.dimLabels).map(([k, label]) =>
       `<button data-dim="${k}" aria-pressed="${k === dim}">${label}</button>`).join('') +
+    `<button data-dim="components" aria-pressed="${dim === 'components'}">${COMP_DIM_LABEL}</button>` +
     '<span style="flex:1"></span>' +
     '<span style="color:var(--muted);font-size:12px">Единицы:</span>' +
     `<button data-unit="cost" aria-pressed="${unit === 'cost'}">$</button>` +
@@ -612,21 +748,30 @@ function controls() {
     b.onclick = () => { unit = b.dataset.unit; render(); });
 }
 
+// Одна группа фильтра: заголовок, «Все/Сброс», поиск, чекбоксы. opts — значения
+// чекбоксов, labels — подписи (для фасетных измерений labels == opts).
+function renderFilterGroup(dimKey, label, opts, labels) {
+  return `<div class="filter-group" data-dim="${dimKey}">` +
+    `<div class="filter-group-head"><span>${escapeHtml(label)}</span>` +
+    `<span class="filter-group-actions">` +
+    `<button type="button" data-act="all">Все</button>` +
+    `<button type="button" data-act="none">Сброс</button></span></div>` +
+    `<input type="search" class="filter-search" data-dim="${dimKey}" placeholder="Поиск…">` +
+    `<div class="filter-options" data-dim="${dimKey}">` +
+    opts.map((v, i) => `<label class="filter-opt"><input type="checkbox" value="${escapeHtml(v)}">` +
+      `<span title="${escapeHtml(labels[i])}">${escapeHtml(labels[i])}</span></label>`).join('') +
+    `</div></div>`;
+}
+
 function renderFilterGroups() {
-  document.getElementById('filterGroups').innerHTML = FILTER_DIMS.map(k => {
-    const opts = DATA.raw[k + 's'];
-    const label = DATA.dimLabels[k];
-    return `<div class="filter-group" data-dim="${k}">` +
-      `<div class="filter-group-head"><span>${escapeHtml(label)}</span>` +
-      `<span class="filter-group-actions">` +
-      `<button type="button" data-act="all">Все</button>` +
-      `<button type="button" data-act="none">Сброс</button></span></div>` +
-      `<input type="search" class="filter-search" data-dim="${k}" placeholder="Поиск…">` +
-      `<div class="filter-options" data-dim="${k}">` +
-      opts.map(v => `<label class="filter-opt"><input type="checkbox" value="${escapeHtml(v)}">` +
-        `<span title="${escapeHtml(v)}">${escapeHtml(v)}</span></label>`).join('') +
-      `</div></div>`;
-  }).join('');
+  // Группа «Компоненты» — не фасетная (у ячейки все 5 компонентов сразу), поэтому
+  // опции задаём явно: чекбокс = компонент, ячейка проходит, если он в ней ненулевой.
+  const compGroup = renderFilterGroup('components', COMP_DIM_LABEL, COMP_KEYS, COMP_LABELS);
+
+  document.getElementById('filterGroups').innerHTML =
+    FILTER_DIMS.map(k =>
+      renderFilterGroup(k, DATA.dimLabels[k], DATA.raw[k + 's'], DATA.raw[k + 's'])
+    ).join('') + compGroup;
 
   const groups = document.getElementById('filterGroups');
   groups.addEventListener('change', e => {
@@ -658,16 +803,23 @@ function renderFilterGroups() {
 
   document.getElementById('filtersReset').onclick = () => {
     FILTER_DIMS.forEach(k => filters[k].clear());
+    filters.components.clear();
     groups.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
     render();
   };
 }
 
 function updateFilterCount(idxs) {
-  const anyActive = FILTER_DIMS.some(k => filters[k].size > 0);
-  document.getElementById('filterCount').textContent = anyActive
-    ? `показано ${fmtInt(idxs.length)} из ${fmtInt(DATA.raw.cost.length)} агрегированных строк`
-    : '';
+  const rowsActive = FILTER_DIMS.some(k => filters[k].size > 0);
+  const compsActive = filters.components.size > 0;
+  const parts = [];
+  if (rowsActive)
+    parts.push(`показано ${fmtInt(idxs.length)} из ${fmtInt(DATA.raw.cost.length)} агрегированных строк`);
+  // Фильтр компонентов не отбирает строки — он сужает, какие слагаемые (Вход/Выход/…)
+  // входят в сумму, поэтому подпись формулируется отдельно, чтобы не читаться как «строк меньше».
+  if (compsActive)
+    parts.push(`учтены компоненты: ${[...filters.components].map(k => COMP_LABELS[COMP_KEYS.indexOf(k)]).join(', ')}`);
+  document.getElementById('filterCount').textContent = parts.join(' · ');
 }
 
 function legend(d) {
@@ -676,7 +828,7 @@ function legend(d) {
   const shown = d.names.filter((n, i) => tot[i] > 0);
   document.getElementById('legend').innerHTML = shown.length < 2 ? '' :
     d.names.map((n, i) => tot[i] > 0
-      ? `<li><span class="swatch" style="background:${colorAt(i)}"></span>${escapeHtml(n)}</li>` : '').join('');
+      ? `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</li>` : '').join('');
 }
 
 function chart(d, m) {
@@ -736,7 +888,7 @@ function chart(d, m) {
       if (v <= 0) return;
       const y0 = y(acc + v), y1 = y(acc);
       const hgt = Math.max(y1 - y0, .6);
-      s += `<rect x="${x}" y="${y0}" width="${bw}" height="${hgt}" fill="${colorAt(si)}" ` +
+      s += `<rect x="${x}" y="${y0}" width="${bw}" height="${hgt}" fill="${seriesColorAt(si)}" ` +
            `rx="${bw >= 8 ? 2 : 1}" data-h="${hi}" data-s="${si}"/>`;
       // 2px разделитель цветом поверхности между сегментами стека
       if (acc > 0) s += `<rect x="${x}" y="${y1 - 1}" width="${bw}" height="2" fill="${sc}"/>`;
@@ -785,7 +937,7 @@ function pie(d) {
   const rows = d.names.map((n, i) => [n, tot[i], i]).filter(r => r[1] > 0);
   const cx = 100, cy = 100, rOuter = 92, rInner = 54, gap = 1.6;
 
-  document.getElementById('pieTitle').textContent = 'Расходы по измерению «' + DATA.dimLabels[dim] + '»';
+  document.getElementById('pieTitle').textContent = 'Расходы по измерению «' + dimLabel(dim) + '»';
   document.getElementById('pieSub').textContent =
     `${DATA.dateFrom} – ${DATA.dateTo} · всего ${exact(total)}`;
   document.getElementById('pieTotal').textContent = compact(total);
@@ -806,7 +958,7 @@ function pie(d) {
     const sweep = total ? v / total * 360 : 0;
     const a0 = angle + gap / 2, a1 = angle + sweep - gap / 2;
     if (a1 > a0) {
-      s += `<path class="pie-slice" d="${donutPath(rOuter, rInner, a0, a1)}" fill="${colorAt(i)}"/>`;
+      s += `<path class="pie-slice" d="${donutPath(rOuter, rInner, a0, a1)}" fill="${seriesColorAt(i)}"/>`;
       if (sweep >= 14) {
         const [lx, ly] = polar((rOuter + rInner) / 2, (a0 + a1) / 2);
         const pct = (v / total * 100).toFixed(1).replace('.', ',');
@@ -820,7 +972,7 @@ function pie(d) {
   document.getElementById('pieLegend').innerHTML = rows
     .sort((a, b) => b[1] - a[1])
     .map(([n, v, i]) =>
-      `<li><span class="swatch" style="background:${colorAt(i)}"></span>` +
+      `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>` +
       `<span class="name">${escapeHtml(n)}</span>` +
       `<span class="pct">${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</span></li>`)
     .join('');
@@ -835,20 +987,65 @@ function table(d, m) {
   const total = main.reduce((a, b) => a + b, 0);
   const ah = Math.max(m.activeHours, 1);
   const otherLabel = isCost() ? 'Токенов' : 'Стоимость';
-  const fmtOther = v => isCost() ? compactTok(v) : '$' + v.toFixed(2).replace('.', ',');
+  const fmtOther = v => isCost() ? compactTok(v) : money2(v);
+  // Ставка ($/Mtok) есть только у моделей — у инструмента/агента/проекта это смесь.
+  const showRates = dim === 'model';
+
+  // Столбцы компонентов (Вход/Выход/Кэш-запись/Кэш-чтение) показываем только когда
+  // строки НЕ сами компоненты — иначе избыточно. В ячейке стоимость сверху, токены
+  // снизу — независимо от переключателя unit.
+  const showCompCols = dim !== 'components';
+  // Объединяет 5 сырых компонентов [in, out, cc5m, cc1h, cr] в 4 столбца таблицы
+  // (Вход/Выход/Кэш-запись/Кэш-чтение), склеивая cc5m+cc1h в один «Кэш-запись» —
+  // общий шаг для одной серии (comp4) и для итоговой строки (tot4).
+  const merge4 = ([in_, out_, cc5m, cc1h, cr]) => [in_, out_, [cc5m[0] + cc1h[0], cc5m[1] + cc1h[1]], cr];
+  const comp4 = si => merge4([0, 1, 2, 3, 4].map(k => [d.compCost[si][k], d.compTok[si][k]]));
+  const compCell = ([c, t]) =>
+    `<td><div class="comp-cost">${money2(c)}</div><div class="comp-tok">${compactTok(t)}</div></td>`;
+
+  const rateCell = n => {
+    const rt = DATA.rates[n];
+    if (!rt) return '<td class="rate-cell"><span class="comp-tok">—</span></td>';
+    const r = v => '$' + (v * 1e6).toFixed(2).replace('.', ',');
+    const cc = rt.cache_create_1h !== rt.cache_create
+      ? r(rt.cache_create) + ' / ' + r(rt.cache_create_1h)
+      : r(rt.cache_create);
+    return `<td class="rate-cell" title="Вход / Выход / Кэш-запись / Кэш-чтение, $/Mtok">` +
+      `<div class="comp-cost">${r(rt.input)}</div>` +
+      `<div class="comp-tok">${r(rt.output)}</div>` +
+      `<div class="comp-tok">${cc}</div>` +
+      `<div class="comp-tok">${r(rt.cache_read)}</div></td>`;
+  };
+
+  const compHeaders = showCompCols
+    ? ['Вход', 'Выход', 'Кэш-запись', 'Кэш-чтение'].map(h => `<th>${h}</th>`).join('')
+    : '';
+  const sumCol = k => [
+    d.compCost.reduce((s, row) => s + row[k], 0),
+    d.compTok.reduce((s, row) => s + row[k], 0),
+  ];
+  const tot4 = showCompCols ? merge4([0, 1, 2, 3, 4].map(sumCol)) : [];
 
   document.getElementById('table').innerHTML =
-    `<thead><tr><th>${DATA.dimLabels[dim]}</th>` +
+    `<thead><tr><th>${dimLabel(dim)}</th>` +
     `<th>${isCost() ? 'Стоимость' : 'Всего токенов'}</th><th>Доля</th>` +
-    `<th>За активный час</th><th>${otherLabel}</th></tr></thead><tbody>` +
+    `<th>За активный час</th><th>${otherLabel}</th>` +
+    compHeaders + (showRates ? '<th>Ставка $/Mtok</th>' : '') +
+    `</tr></thead><tbody>` +
     rows.map(([n, v, o, i]) =>
-      `<tr><td><span class="name-cell"><span class="swatch" style="background:${colorAt(i)}"></span>${escapeHtml(n)}</span></td>` +
+      `<tr><td><span class="name-cell"><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</span></td>` +
       `<td>${exact(v)}</td>` +
       `<td>${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</td>` +
-      `<td>${exact(v / ah)}</td><td>${fmtOther(o)}</td></tr>`).join('') +
+      `<td>${exact(v / ah)}</td><td>${fmtOther(o)}</td>` +
+      (showCompCols ? comp4(i).map(compCell).join('') : '') +
+      (showRates ? rateCell(n) : '') +
+      `</tr>`).join('') +
     `</tbody><tfoot><tr><td>Итого</td><td>${exact(total)}</td><td>100,0%</td>` +
     `<td>${exact(total / ah)}</td>` +
-    `<td>${fmtOther(other.reduce((a, b) => a + b, 0))}</td></tr></tfoot>`;
+    `<td>${fmtOther(other.reduce((a, b) => a + b, 0))}</td>` +
+    (showCompCols ? tot4.map(compCell).join('') : '') +
+    (showRates ? '<td></td>' : '') +
+    `</tr></tfoot>`;
 }
 
 let curD = null, curM = null, curBucket = null;
@@ -863,9 +1060,9 @@ document.getElementById('chart').addEventListener('mousemove', e => {
   tip.innerHTML = `<b>${bucketLabel(b.bucketSize, DATA.hours, hi, b.offset)}</b>` +
     `<div class="row"><span>всего</span><span>${exact(b.series[hi])}</span></div>` +
     `<div class="row" style="opacity:.65"><span>${isCost() ? 'токенов' : 'стоимость'}</span>` +
-    `<span>${isCost() ? compactTok(alt) : '$' + alt.toFixed(2).replace('.', ',')}</span></div>` +
+    `<span>${isCost() ? compactTok(alt) : money2(alt)}</span></div>` +
     cells.map(([n, v, i]) =>
-      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${colorAt(i)}"></span> ${escapeHtml(n)}</span>` +
+      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${seriesColorAt(i)}"></span> ${escapeHtml(n)}</span>` +
       `<span>${exact(v)}</span></div>`).join('');
   tip.style.opacity = 1;
   const r = tip.getBoundingClientRect();
@@ -888,7 +1085,7 @@ function render() {
   tiles(m); legend(d); chart(d, m); pie(d); table(d, m);
   updateFilterCount(idxs);
   document.getElementById('foot').textContent = d.otherCount
-    ? `«Прочее» объединяет ещё ${d.otherCount} значений измерения «${DATA.dimLabels[dim]}».` : '';
+    ? `«Прочее» объединяет ещё ${d.otherCount} значений измерения «${dimLabel(dim)}».` : '';
 }
 
 document.getElementById('subtitle').textContent =
@@ -941,9 +1138,15 @@ def main() -> None:
     payload = build_payload(rows, rates)
     out.write_text(render_html(payload), encoding="utf-8")
 
+    # raw не хранит готовую сумму cost/tokens по ячейке (выводима из 5
+    # компонентов, JS считает её один раз на клиенте) — здесь для сводки в
+    # терминал складываем компоненты тем же способом.
     raw = payload["raw"]
-    hours_with_data = {raw["hourIdx"][i] for i, tok in enumerate(raw["tokens"]) if tok > 0}
-    total_cost = sum(raw["cost"])
+    tok_cols = [raw[k] for k in COMPONENT_KEYS]
+    cost_cols = [raw[cost_key(k)] for k in COMPONENT_KEYS]
+    tokens_per_cell = [sum(col[i] for col in tok_cols) for i in range(len(raw["hourIdx"]))]
+    hours_with_data = {raw["hourIdx"][i] for i, tok in enumerate(tokens_per_cell) if tok > 0}
+    total_cost = sum(sum(col) for col in cost_cols)
 
     print(f"{out}")
     print(
