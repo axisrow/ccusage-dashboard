@@ -50,11 +50,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **`pricing.py`** — таблица ставок `dict[model] -> Rates`, кэшируется в
   `rates.json`. Источники ставок, в порядке приоритета (см. `NO_FIT`,
-  `from_litellm`, `fit_rates`):
-  1. LiteLLM (`fetch_litellm`) — с учётом TTL кэша (1h дороже 5m).
-  2. МНК-подгонка из `ccusage` (`fit_rates`) — только для моделей вне LiteLLM,
+  `from_litellm`, `fit_rates`, `FALLBACK`, `canonical_name`):
+  1. LiteLLM (`fetch_litellm`) — с учётом TTL кэша (1h дороже 5m). Алиасы/варианты
+     (glm-5.2:cloud, deepseek-v4-flash:cloud) сводятся к каноническому имени через
+     `ALIASES` → `canonical_name` (явная таблица, не срез `:suffix` — он ломает deepseek).
+  2. Фоллбэк-список `FALLBACK` — цены для моделей, которых нет в LiteLLM под именами
+     из `PREFIXES` (glm-5.2 — в LiteLLM она только под `cloudflare/@cf/zai-org/glm-5.2`).
+     Детерминированная цена идёт перед подгонкой.
+  3. МНК-подгонка из `ccusage` (`fit_rates`) — только для моделей вне LiteLLM,
      **никогда** для моделей Anthropic (`NO_FIT`), там подгонка даёт абсурд.
-  3. `$0` — только если нет цены в LiteLLM И `ccusage` стабильно (3+ дня)
+  4. `$0` — только если нет цены в LiteLLM И `ccusage` стабильно (3+ дня)
      отдаёт ноль. Модель без прайса не считается бесплатной: её объём уходит
      в отдельную строку «без прайсинга», а не смешивается с `$0`.
 

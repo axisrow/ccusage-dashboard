@@ -1,12 +1,4 @@
 {
- "claude-opus-4-8": {
-  "input": 5e-06,
-  "output": 2.5e-05,
-  "cache_create": 6.25e-06,
-  "cache_read": 5e-07,
-  "cache_create_1h": 1e-05,
-  "source": "litellm"
- },
  "claude-sonnet-5": {
   "input": 2e-06,
   "output": 1e-05,
@@ -15,28 +7,36 @@
   "cache_create_1h": 4e-06,
   "source": "litellm"
  },
- "claude-haiku-4-5-20251001": {
-  "input": 1e-06,
-  "output": 5e-06,
-  "cache_create": 1.25e-06,
-  "cache_read": 1e-07,
-  "cache_create_1h": 2e-06,
-  "source": "litellm"
- },
- "glm-5.2": {
-  "input": 1.3999999999999072e-06,
-  "output": 4.399999999999371e-06,
-  "cache_create": 0.0,
-  "cache_read": 2.600000000000028e-07,
-  "cache_create_1h": 0.0,
-  "source": "fitted:0.00%"
- },
  "claude-sonnet-4-6": {
   "input": 3e-06,
   "output": 1.5e-05,
   "cache_create": 3.75e-06,
   "cache_read": 3e-07,
   "cache_create_1h": 6e-06,
+  "source": "litellm"
+ },
+ "glm-5.2": {
+  "input": 1.4e-06,
+  "output": 4.4e-06,
+  "cache_create": 0.0,
+  "cache_read": 2.6e-07,
+  "cache_create_1h": 0.0,
+  "source": "fallback"
+ },
+ "claude-opus-4-8": {
+  "input": 5e-06,
+  "output": 2.5e-05,
+  "cache_create": 6.25e-06,
+  "cache_read": 5e-07,
+  "cache_create_1h": 1e-05,
+  "source": "litellm"
+ },
+ "claude-fable-5": {
+  "input": 1e-05,
+  "output": 5e-05,
+  "cache_create": 1.25e-05,
+  "cache_read": 1e-06,
+  "cache_create_1h": 2e-05,
   "source": "litellm"
  },
  "glm-4.7": {
@@ -47,19 +47,19 @@
   "cache_create_1h": 0.0,
   "source": "litellm:zai/glm-4.7"
  },
- "claude-fable-5": {
-  "input": 1e-05,
-  "output": 5e-05,
-  "cache_create": 1.25e-05,
-  "cache_read": 1e-06,
-  "cache_create_1h": 2e-05,
+ "claude-haiku-4-5-20251001": {
+  "input": 1e-06,
+  "output": 5e-06,
+  "cache_create": 1.25e-06,
+  "cache_read": 1e-07,
+  "cache_create_1h": 2e-06,
   "source": "litellm"
  },
  "glm-5-turbo": {
-  "input": 1.2000000000004751e-06,
-  "output": 3.999999999998081e-06,
+  "input": 1.2000000000000669e-06,
+  "output": 4.000000000000246e-06,
   "cache_create": 0.0,
-  "cache_read": 2.399999999999897e-07,
+  "cache_read": 2.3999999999999675e-07,
   "cache_create_1h": 0.0,
   "source": "fitted:0.00%"
  },
@@ -88,35 +88,27 @@
   "source": "litellm"
  },
  "deepseek-v4-flash:0731": {
-  "input": 1.4794266832942853e-07,
-  "output": 0.0,
+  "input": 1.4e-07,
+  "output": 2.8e-07,
   "cache_create": 0.0,
-  "cache_read": 0.0,
-  "cache_create_1h": 0.0,
-  "source": "fitted:0.00%"
- },
- "gpt-5.2": {
-  "input": 1.75e-06,
-  "output": 1.4e-05,
-  "cache_create": 0.0,
-  "cache_read": 1.75e-07,
+  "cache_read": 2.8e-09,
   "cache_create_1h": 0.0,
   "source": "litellm"
  },
- "gpt-5.4": {
-  "input": 2.5e-06,
-  "output": 1.5e-05,
+ "glm-5.2:cloud": {
+  "input": 1.4e-06,
+  "output": 4.4e-06,
   "cache_create": 0.0,
-  "cache_read": 2.5e-07,
+  "cache_read": 2.6e-07,
   "cache_create_1h": 0.0,
-  "source": "litellm"
+  "source": "fallback"
  },
- "gpt-5.4-mini": {
-  "input": 7.5e-07,
-  "output": 4.5e-06,
-  "cache_create": 0.0,
-  "cache_read": 7.5e-08,
-  "cache_create_1h": 0.0,
+ "gpt-5.6-sol": {
+  "input": 5e-06,
+  "output": 3e-05,
+  "cache_create": 6.25e-06,
+  "cache_read": 5e-07,
+  "cache_create_1h": 6.25e-06,
   "source": "litellm"
  },
  "gpt-5.5": {
@@ -127,43 +119,19 @@
   "cache_create_1h": 0.0,
   "source": "litellm"
  },
- "gpt-5.3-codex": {
-  "input": 1.75e-06,
-  "output": 1.4e-05,
+ "gpt-5.6-luna": {
+  "input": 2e-07,
+  "output": 1.2e-06,
+  "cache_create": 2.5e-07,
+  "cache_read": 2e-08,
+  "cache_create_1h": 2.5e-07,
+  "source": "litellm"
+ },
+ "gpt-5.4": {
+  "input": 2.5e-06,
+  "output": 1.5e-05,
   "cache_create": 0.0,
-  "cache_read": 1.75e-07,
-  "cache_create_1h": 0.0,
-  "source": "litellm"
- },
- "gpt-5.6-terra": {
-  "input": 2e-06,
-  "output": 1.2e-05,
-  "cache_create": 2.5e-06,
-  "cache_read": 2e-07,
-  "cache_create_1h": 2.5e-06,
-  "source": "litellm"
- },
- "gpt-5.2-codex": {
-  "input": 1.75e-06,
-  "output": 1.4e-05,
-  "cache_create": 0.0,
-  "cache_read": 1.75e-07,
-  "cache_create_1h": 0.0,
-  "source": "litellm"
- },
- "gpt-5.6-sol": {
-  "input": 5e-06,
-  "output": 3e-05,
-  "cache_create": 6.25e-06,
-  "cache_read": 5e-07,
-  "cache_create_1h": 6.25e-06,
-  "source": "litellm"
- },
- "gpt-5.1-codex-max": {
-  "input": 1.25e-06,
-  "output": 1e-05,
-  "cache_create": 0.0,
-  "cache_read": 1.25e-07,
+  "cache_read": 2.5e-07,
   "cache_create_1h": 0.0,
   "source": "litellm"
  },
@@ -175,12 +143,68 @@
   "cache_create_1h": 0.0,
   "source": "litellm"
  },
- "gpt-5.6-luna": {
-  "input": 2e-07,
-  "output": 1.2e-06,
-  "cache_create": 2.5e-07,
-  "cache_read": 2e-08,
-  "cache_create_1h": 2.5e-07,
+ "gpt-5.2": {
+  "input": 1.75e-06,
+  "output": 1.4e-05,
+  "cache_create": 0.0,
+  "cache_read": 1.75e-07,
+  "cache_create_1h": 0.0,
   "source": "litellm"
+ },
+ "gpt-5.1-codex-max": {
+  "input": 1.25e-06,
+  "output": 1e-05,
+  "cache_create": 0.0,
+  "cache_read": 1.25e-07,
+  "cache_create_1h": 0.0,
+  "source": "litellm"
+ },
+ "gpt-5.6-terra": {
+  "input": 2e-06,
+  "output": 1.2e-05,
+  "cache_create": 2.5e-06,
+  "cache_read": 2e-07,
+  "cache_create_1h": 2.5e-06,
+  "source": "litellm"
+ },
+ "deepseek-v4-flash": {
+  "input": 1.4e-07,
+  "output": 2.8e-07,
+  "cache_create": 0.0,
+  "cache_read": 2.8e-09,
+  "cache_create_1h": 0.0,
+  "source": "litellm"
+ },
+ "gpt-5.2-codex": {
+  "input": 1.75e-06,
+  "output": 1.4e-05,
+  "cache_create": 0.0,
+  "cache_read": 1.75e-07,
+  "cache_create_1h": 0.0,
+  "source": "litellm"
+ },
+ "gpt-5.3-codex": {
+  "input": 1.75e-06,
+  "output": 1.4e-05,
+  "cache_create": 0.0,
+  "cache_read": 1.75e-07,
+  "cache_create_1h": 0.0,
+  "source": "litellm"
+ },
+ "gpt-5.4-mini": {
+  "input": 7.5e-07,
+  "output": 4.5e-06,
+  "cache_create": 0.0,
+  "cache_read": 7.5e-08,
+  "cache_create_1h": 0.0,
+  "source": "litellm"
+ },
+ "gpt-5.3-codex-spark": {
+  "input": 1.75e-06,
+  "output": 1.4e-05,
+  "cache_create": 0.0,
+  "cache_read": 1.75e-07,
+  "cache_create_1h": 0.0,
+  "source": "fallback"
  }
 }
