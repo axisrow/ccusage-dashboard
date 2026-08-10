@@ -200,12 +200,15 @@ def run_ccusage(tool: str, since: str, until: str, extra_args: tuple = ()) -> di
 # --------------------------------------------------------------------------- #
 
 
-# Цены для моделей, которых нет в LiteLLM под именами из PREFIXES. Ключ —
-# каноническое имя (из ALIASES). Значения — $/токен, 4 компонента:
-# (input, output, cache_create, cache_read). Цифры взяты из LiteLLM
-# (cloudflare/@cf/zai-org/glm-5.2: input 1.4e-6, output 4.4e-6, cache_read 2.6e-7).
+# Цены для моделей, которых нет в LiteLLM под именами из PREFIXES (или есть,
+# но без ценовых полей). Ключ — каноническое имя (из ALIASES). Значения —
+# $/токен, 4 компонента: (input, output, cache_create, cache_read). Цифры взяты
+# из LiteLLM (cloudflare/@cf/zai-org/glm-5.2: input 1.4e-6, output 4.4e-6,
+# cache_read 2.6e-7) и из прайс-листа OpenAI (gpt-5.3-codex-spark: input 1.75e-6,
+# output 1.4e-5, cache_read 1.75e-7 — та же ставка, что у gpt-5.3-codex).
 FALLBACK = {
     "glm-5.2": Rates((1.4e-6, 4.4e-6, 0.0, 2.6e-7), source="fallback"),
+    "gpt-5.3-codex-spark": Rates((1.75e-6, 1.4e-5, 0.0, 1.75e-7), source="fallback"),
 }
 
 
