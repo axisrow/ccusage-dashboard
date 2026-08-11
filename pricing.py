@@ -90,6 +90,13 @@ def canonical_name(name: str) -> str:
     return ALIASES.get(name, name)
 
 
+def split_cache_create(cc: int, cc_1h: int) -> tuple[int, int]:
+    """Раскладывает cache_create на (cc5m, cc1h): cc включает cc_1h, поэтому
+    cc5m = cc - cc_1h. Единственное место с этой формулой — используется и для
+    стоимости (Rates.cost_components), и для сырых токен-компонентов (report.py)."""
+    return max(cc - cc_1h, 0), cc_1h
+
+
 class Rates:
     """Ставки одной модели: 4 компонента + отдельная ставка записи кэша с TTL 1h."""
 
@@ -100,16 +107,21 @@ class Rates:
         self.cache_create_1h = cache_create_1h if cache_create_1h else self.cache_create
         self.source = source
 
-    def cost(self, inp: int, out: int, cc: int, cr: int, cc_1h: int = 0) -> float:
-        """Стоимость записи. cc_1h — часть cc, записанная с TTL 1h (тарифицируется дороже)."""
-        cc_5m = max(cc - cc_1h, 0)
+    def cost_components(self, inp: int, out: int, cc: int, cr: int, cc_1h: int = 0) -> tuple[float, ...]:
+        """Стоимость по 5 компонентам (in, out, cc5m, cc1h, cr). cc_1h — часть cc,
+        записанная с TTL 1h (тарифицируется дороже), поэтому cc5m = cc - cc_1h."""
+        cc_5m, cc_1h = split_cache_create(cc, cc_1h)
         return (
-            inp * self.input
-            + out * self.output
-            + cc_5m * self.cache_create
-            + cc_1h * self.cache_create_1h
-            + cr * self.cache_read
+            inp * self.input,
+            out * self.output,
+            cc_5m * self.cache_create,
+            cc_1h * self.cache_create_1h,
+            cr * self.cache_read,
         )
+
+    def cost(self, inp: int, out: int, cc: int, cr: int, cc_1h: int = 0) -> float:
+        """Стоимость записи — сумма компонентов (см. cost_components)."""
+        return sum(self.cost_components(inp, out, cc, cr, cc_1h))
 
     def as_dict(self) -> dict:
         return {
