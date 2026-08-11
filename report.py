@@ -760,10 +760,10 @@ function computeMetrics(idxs) {
     const peak = series.length ? Math.max(...series) : 0;
     metrics[u] = {
       grand, avgActive: grand / nActive, avgCalendar: grand / H,
-      // Нормализация на сессию: avgSessionPerActiveHour = расход на сессию за
-      // активный час с учётом параллельности (Σ сессий по активным часам);
-      // avgSession = средний расход одной сессии за весь период.
-      avgSessionPerActiveHour: totalSessionHours ? grand / totalSessionHours : 0,
+      // Нормализация на сессию: avgPerSessionHour = расход на сессия-час
+      // (grand / Σ сессий по активным часам, с учётом параллельности);
+      // avgSession = средний расход одной УНИКАЛЬНОЙ сессии за весь период.
+      avgPerSessionHour: totalSessionHours ? grand / totalSessionHours : 0,
       avgSession: totalSessions ? grand / totalSessions : 0,
       peak, peakHour: series.length && peak > 0 ? DATA.hours[series.indexOf(peak)] : '',
     };
@@ -782,7 +782,7 @@ function tiles(m) {
   const session = avgMode === 'session';
   const items = [
     [session ? what + ' в среднем на сессию в активном часу' : what + ' в среднем за активный час',
-     compact(session ? mu.avgSessionPerActiveHour : mu.avgActive),
+     compact(session ? mu.avgPerSessionHour : mu.avgActive),
      session ? m.totalSessions + ' сессий · ' + m.totalSessionHours + ' сессия-часов'
              : m.activeHours + ' активных часов из ' + m.calendarHours],
     [session ? 'В среднем на сессию за период' : 'В среднем за календарный час',
@@ -941,7 +941,7 @@ function legend(d) {
 function avgLineY(bucketSize, m, series, hours, offset, mode, sessPerBucket) {
   // «Активный час»: линия = среднее по активным часам (avgActive). В режиме
   // «сессия» линия должна быть средним столбиков (расход на УНИКАЛЬНУЮ сессию
-  // в бакете), а не avgSessionPerActiveHour (на сессия-час) — иначе для часа
+  // в бакете), а не avgPerSessionHour (на сессия-час) — иначе для часа
   // линия не совпадает со столбиками, как в день/неделя. Для HOUR sessPerBucket
   // = sessionsPerHour, поэтому общий путь ниже даёт именно среднее столбиков.
   if (bucketSize === HOUR && mode !== 'session')
