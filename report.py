@@ -939,8 +939,13 @@ function legend(d) {
 // сессия-часов в бакете (бакетизируется через bucketizeSeries). Оба режима —
 // частные случаи одного «среднее по бакетам с знаменателем», поэтому одна функция.
 function avgLineY(bucketSize, m, series, hours, offset, mode, sessPerBucket) {
-  if (bucketSize === HOUR)
-    return m.metrics[unit][mode === 'session' ? 'avgSessionPerActiveHour' : 'avgActive'];
+  // «Активный час»: линия = среднее по активным часам (avgActive). В режиме
+  // «сессия» линия должна быть средним столбиков (расход на УНИКАЛЬНУЮ сессию
+  // в бакете), а не avgSessionPerActiveHour (на сессия-час) — иначе для часа
+  // линия не совпадает со столбиками, как в день/неделя. Для HOUR sessPerBucket
+  // = sessionsPerHour, поэтому общий путь ниже даёт именно среднее столбиков.
+  if (bucketSize === HOUR && mode !== 'session')
+    return m.metrics[unit]['avgActive'];
   const per = [];
   for (let bi = 0; bi < series.length; bi++) {
     const d = sessPerBucket ? sessPerBucket[bi] : 1;
