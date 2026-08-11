@@ -52,6 +52,7 @@ class Row(NamedTuple):
     model: str
     agent: str  # main / имя подагента
     project: str  # абсолютный cwd либо "unknown"
+    session: str  # каталог сессии (идентичность уникальна в рамках инструмента)
     input: int
     output: int
     cache_create: int
@@ -74,6 +75,28 @@ def _local_parts(ts: str) -> tuple[str, str] | None:
     return dt.strftime("%Y-%m-%dT%H"), dt.strftime("%Y-%m-%d")
 
 
+def _session_id(path: str, marker: str, offset: int) -> str:
+    """Идентификатор сессии из пути лога — компонент, отстоящий на `offset` от маркера.
+
+    Claude:  основные файлы ~/.claude/projects/<проект>/<sessionId>.jsonl (плоские),
+             сабагенты  <проект>/<sessionId>/subagents/agent-*.jsonl -> "projects", offset 2
+    Основной Claude-файл приносит сессию с суффиксом «.jsonl», а сабагент — без,
+    поэтому срезаем расширение, чтобы оба отображались на одну сессию.
+    Codex не использует этот хелпер: его сессия — сам rollout-файл (см. parse_codex)."""
+    parts = path.split(os.sep)
+    # Якорь — каталог ".claude": "projects" идёт сразу после него, а не первый
+    # "projects" в пути. Иначе домашний каталог, сам названный projects
+    # (например /Users/projects/axisrow/...), сдвигал бы индекс и схлопывал все
+    # Claude-сессии в одно значение ".claude".
+    if ".claude" in parts:
+        i = parts.index(".claude") + 1
+        if i < len(parts) and parts[i] == marker:
+            j = i + offset
+            if j < len(parts):
+                return os.path.splitext(parts[j])[0]
+    return "unknown"
+
+
 # --------------------------------------------------------------------------- #
 # Claude
 # --------------------------------------------------------------------------- #
@@ -89,6 +112,8 @@ def parse_claude(path: str) -> list[Row]:
     частичными.
     """
     best: dict[str, tuple[int, Row]] = {}
+    # сессия одна на весь файл — вычислить до цикла, а не на каждую строку
+    session = _session_id(path, "projects", 2)
     try:
         fh = open(path, errors="ignore")
     except OSError:
@@ -141,6 +166,7 @@ def parse_claude(path: str) -> list[Row]:
                 model=msg.get("model") or "unknown",
                 agent=agent,
                 project=rec.get("cwd") or "unknown",
+                session=session,
                 input=inp,
                 output=out,
                 cache_create=cc,
@@ -194,6 +220,10 @@ def parse_codex(path: str) -> list[Row]:
     """
     rows: list[Row] = []
     seen: set[tuple] = set()
+    # сессия одна на весь файл — вычислить до цикла, а не на каждую строку.
+    # Codex-сессия — это сам rollout-файл: layout ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl,
+    # поэтому идентичность берём из имени файла (в нём UUID), а не из каталога (там год).
+    session = os.path.splitext(os.path.basename(path))[0]
     cwd = "unknown"
     source: object = None
     originator: str | None = None
@@ -276,6 +306,7 @@ def parse_codex(path: str) -> list[Row]:
                     model=model or "unknown",
                     agent=_codex_agent(source, originator),
                     project=cwd,
+                    session=session,
                     input=max(inp - cached, 0),
                     output=out,
                     cache_create=last.get("cache_write_input_tokens", 0) or 0,
