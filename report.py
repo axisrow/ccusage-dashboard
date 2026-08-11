@@ -530,6 +530,7 @@ function bucketize(hours, grid, series, bucketSize, offset) {
 let dim = 'tool';                        // tool | model | agent | project | components
 let unit = 'cost';                       // cost | tokens
 let bucketSizeMode = 'auto';             // 'auto' | 'hour' | 'day' | 'week' — ключ кнопки грануляции, как dim/unit
+let avgMode = 'hour';                    // 'hour' | 'session' — знаменатель линии среднего на графике
 const FILTER_DIMS = ['tool', 'model', 'agent', 'project'];
 const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set(), components: new Set() };
 
@@ -739,23 +740,28 @@ function computeMetrics(idxs) {
     };
   }
   return { byHour, metrics, activeHours: activeIdx.length, calendarHours: H,
-    totalSessions, totalSessionHours, records: idxs.length };
+    totalSessions, totalSessionHours,
+    sessionsPerHour: sessInHour.map(s => s.size), records: idxs.length };
 }
 
 function tiles(m) {
   const mu = m.metrics[unit];
   const what = isCost() ? 'Расход' : 'Токены';
+  // Переключатель «Среднее: активный час / сессия» переключает основные тайлы:
+  // в режиме «сессия» тайлы «активный час»/«календарный час» становятся
+  // «на сессию в активном часу»/«на сессию за период».
+  const session = avgMode === 'session';
   const items = [
-    [what + ' в среднем за активный час', compact(mu.avgActive),
-     m.activeHours + ' активных часов из ' + m.calendarHours],
-    ['В среднем за календарный час', compact(mu.avgCalendar), 'с учётом простоев'],
+    [session ? what + ' в среднем на сессию в активном часу' : what + ' в среднем за активный час',
+     compact(session ? mu.avgSessionPerActiveHour : mu.avgActive),
+     session ? m.totalSessions + ' сессий · ' + m.totalSessionHours + ' сессия-часов'
+             : m.activeHours + ' активных часов из ' + m.calendarHours],
+    [session ? 'В среднем на сессию за период' : 'В среднем за календарный час',
+     compact(session ? mu.avgSession : mu.avgCalendar),
+     session ? m.totalSessions + ' сессий за период' : 'с учётом простоев'],
     ['Пик за час', compact(mu.peak), mu.peakHour ? hourLabel(mu.peakHour) : ''],
     [isCost() ? 'Всего' : 'Всего токенов', compact(mu.grand),
      fmtInt(DATA.rawRecords) + ' записей за период'],
-    [what + ' в среднем на сессию в активном часу', compact(mu.avgSessionPerActiveHour),
-     m.totalSessions + ' сессий · ' + m.totalSessionHours + ' сессия-часов'],
-    [what + ' в среднем за сессию', compact(mu.avgSession),
-     m.totalSessions + ' сессий за период'],
   ];
   document.getElementById('tiles').innerHTML = items.map(([l, v, n]) =>
     `<div><div class="tile-label">${l}</div><div class="tile-value">${v}</div>` +
@@ -790,21 +796,29 @@ function controls() {
     '<span style="flex:1"></span>' +
     '<span style="color:var(--muted);font-size:12px">Единицы:</span>' +
     `<button data-unit="cost" aria-pressed="${unit === 'cost'}">$</button>` +
-    `<button data-unit="tokens" aria-pressed="${unit === 'tokens'}">токены</button>`;
+    `<button data-unit="tokens" aria-pressed="${unit === 'tokens'}">токены</button>` +
+    '<span style="color:var(--muted);font-size:12px">Среднее:</span>' +
+    `<button data-avg="hour" aria-pressed="${avgMode === 'hour'}">активный час</button>` +
+    `<button data-avg="session" aria-pressed="${avgMode === 'session'}">сессия</button>`;
   document.querySelectorAll('#controls button[data-dim]').forEach(b =>
     b.onclick = () => { dim = b.dataset.dim; render(); });
   document.querySelectorAll('#controls button[data-unit]').forEach(b =>
     b.onclick = () => { unit = b.dataset.unit; render(); });
-  // Грануляция влияет только на график (ось X) — тайлы, таблицу и пирог она не
-  // затрагивает, поэтому перерисовываем лишь chart() поверх кэша curD/curM и
-  // точечно подсвечиваем активную кнопку, а не весь render().
-  document.querySelectorAll('#controls button[data-bucket]').forEach(b =>
-    b.onclick = () => {
-      bucketSizeMode = b.dataset.bucket;
-      document.querySelectorAll('#controls button[data-bucket]').forEach(x =>
-        x.setAttribute('aria-pressed', String(x.dataset.bucket === bucketSizeMode)));
-      if (curD && curM) chart(curD, curM);
-    });
+  // Группа кнопок-переключателей: читают dataset-ключ, пишут state-переменную,
+  // обновляют aria-pressed по группе и вызывают колбэк. Грануляция влияет только
+  // на график (chart поверх кэша), «Среднее» — на тайлы/таблицу/график (render).
+  const bindToggle = (sel, key, set, after) => {
+    document.querySelectorAll(sel).forEach(b =>
+      b.onclick = () => {
+        set(b.dataset[key]);
+        document.querySelectorAll(sel).forEach(x =>
+          x.setAttribute('aria-pressed', String(x.dataset[key] === b.dataset[key])));
+        after();
+      });
+  };
+  bindToggle('#controls button[data-bucket]', 'bucket', v => bucketSizeMode = v,
+    () => { if (curD && curM) chart(curD, curM); });
+  bindToggle('#controls button[data-avg]', 'avg', v => avgMode = v, render);
 }
 
 // Одна группа фильтра: заголовок, «Все/Сброс», поиск, чекбоксы. opts — значения
@@ -888,6 +902,24 @@ function legend(d) {
   document.getElementById('legend').innerHTML = shown.length < 2 ? '' :
     d.names.map((n, i) => tot[i] > 0
       ? `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</li>` : '').join('');
+}
+
+// Значение линии среднего: HOUR — готовый метрик из m.metrics[unit]; DAY/WEEK —
+// среднее по ненулевым бакетам отношения суммы бакета к знаменателю. Для
+// «активного часа» знаменатель 1 (среднее по бакетам), для «на сессию» — число
+// сессия-часов в бакете (бакетизируется через bucketizeSeries). Оба режима —
+// частные случаи одного «среднее по бакетам с знаменателем», поэтому одна функция.
+function avgLineY(bucketSize, m, series, hours, offset, mode) {
+  if (bucketSize === HOUR)
+    return m.metrics[unit][mode === 'session' ? 'avgSessionPerActiveHour' : 'avgActive'];
+  const sessPerBucket = mode === 'session'
+    ? bucketizeSeries(hours, m.sessionsPerHour, bucketSize, offset) : null;
+  const per = [];
+  for (let bi = 0; bi < series.length; bi++) {
+    const d = sessPerBucket ? sessPerBucket[bi] : 1;
+    if (series[bi] > 0 && d > 0) per.push(series[bi] / d);
+  }
+  return average(per);
 }
 
 function chart(d, m) {
@@ -989,8 +1021,10 @@ function chart(d, m) {
   // размерности, что и столбики), а не пересчитываем avgActive обратно в часы —
   // средний размер активного бакета (последний может быть неполным) не совпадает
   // с bucketSize, так что домножение на bucketSize было бы неточным.
-  const avgY = bucketSize === HOUR ? m.metrics[unit].avgActive : average(series.filter(v => v > 0));
-  const avgLabel = `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
+  const avgY = avgLineY(bucketSize, m, series, hours, offset, avgMode);
+  const avgLabel = avgMode === 'session'
+    ? `среднее на сессию за ${BUCKET_UNIT_LABEL[bucketSize]}`
+    : `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
   const ya = y(avgY);
   const avgText = `${avgLabel} · ${compact(avgY)}`;
   const tw = avgText.length * 5.9 + 10;
@@ -1060,7 +1094,12 @@ function table(d, m) {
   const rows = d.names.map((n, i) => [n, main[i], other[i], i])
     .filter(r => r[1] > 0 || r[2] > 0).sort((a, b) => b[1] - a[1] || b[2] - a[2]);
   const total = main.reduce((a, b) => a + b, 0);
-  const ah = Math.max(m.activeHours, 1);
+  // Знаменатель столбца «За активный час»/«За сессию» — глобальный, как и раньше
+  // (активные часы), но в режиме «сессия» — сессия-часы (Σ уникальных сессий по
+  // активным часам), тот же знаменатель, что у линии среднего на графике и у
+  // тайла «на сессию в активном часу» (avgSessionPerActiveHour).
+  const denom = avgMode === 'session' ? Math.max(m.totalSessionHours, 1) : Math.max(m.activeHours, 1);
+  const rateLabel = avgMode === 'session' ? 'За сессию' : 'За активный час';
   const otherLabel = isCost() ? 'Токенов' : 'Стоимость';
   const fmtOther = v => isCost() ? compactTok(v) : money2(v);
   // Ставка ($/Mtok) есть только у моделей — у инструмента/агента/проекта это смесь.
@@ -1104,19 +1143,19 @@ function table(d, m) {
   document.getElementById('table').innerHTML =
     `<thead><tr><th>${dimLabel(dim)}</th>` +
     `<th>${isCost() ? 'Стоимость' : 'Всего токенов'}</th><th>Доля</th>` +
-    `<th>За активный час</th><th>${otherLabel}</th>` +
+    `<th>${rateLabel}</th><th>${otherLabel}</th>` +
     compHeaders + (showRates ? '<th>Ставка $/Mtok</th>' : '') +
     `</tr></thead><tbody>` +
     rows.map(([n, v, o, i]) =>
       `<tr><td><span class="name-cell"><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</span></td>` +
       `<td>${exact(v)}</td>` +
       `<td>${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</td>` +
-      `<td>${exact(v / ah)}</td><td>${fmtOther(o)}</td>` +
+      `<td>${exact(v / denom)}</td><td>${fmtOther(o)}</td>` +
       (showCompCols ? comp4(i).map(compCell).join('') : '') +
       (showRates ? rateCell(n) : '') +
       `</tr>`).join('') +
     `</tbody><tfoot><tr><td>Итого</td><td>${exact(total)}</td><td>100,0%</td>` +
-    `<td>${exact(total / ah)}</td>` +
+    `<td>${exact(total / denom)}</td>` +
     `<td>${fmtOther(other.reduce((a, b) => a + b, 0))}</td>` +
     (showCompCols ? tot4.map(compCell).join('') : '') +
     (showRates ? '<td></td>' : '') +
