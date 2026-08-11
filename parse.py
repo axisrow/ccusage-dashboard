@@ -80,9 +80,9 @@ def _session_id(path: str, marker: str, offset: int) -> str:
 
     Claude:  основные файлы ~/.claude/projects/<проект>/<sessionId>.jsonl (плоские),
              сабагенты  <проект>/<sessionId>/subagents/agent-*.jsonl -> "projects", offset 2
-    Codex:   ~/.codex/sessions/<session>/rollout-*                    -> "sessions", offset 1
     Основной Claude-файл приносит сессию с суффиксом «.jsonl», а сабагент — без,
-    поэтому срезаем расширение, чтобы оба отображались на одну сессию."""
+    поэтому срезаем расширение, чтобы оба отображались на одну сессию.
+    Codex не использует этот хелпер: его сессия — сам rollout-файл (см. parse_codex)."""
     parts = path.split(os.sep)
     if marker in parts:
         i = parts.index(marker)
@@ -215,8 +215,10 @@ def parse_codex(path: str) -> list[Row]:
     """
     rows: list[Row] = []
     seen: set[tuple] = set()
-    # сессия одна на весь файл — вычислить до цикла, а не на каждую строку
-    session = _session_id(path, "sessions", 1)
+    # сессия одна на весь файл — вычислить до цикла, а не на каждую строку.
+    # Codex-сессия — это сам rollout-файл: layout ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl,
+    # поэтому идентичность берём из имени файла (в нём UUID), а не из каталога (там год).
+    session = os.path.splitext(os.path.basename(path))[0]
     cwd = "unknown"
     source: object = None
     originator: str | None = None

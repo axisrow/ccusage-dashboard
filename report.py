@@ -705,7 +705,9 @@ function computeMetrics(idxs) {
   const costHour = new Array(H).fill(0), tokHour = new Array(H).fill(0);
   // Уникальные сессии в каждом часу — та же «активность», что и tokHour (comps):
   // сессия «в часу», если у неё есть ячейка с ненулевой активностью под фильтром.
-  // totalSessions собирается в том же цикле (все отфильтрованные сессии за период).
+  // totalSessions собирается в том же цикле и по тому же правилу (t > 0), иначе
+  // сессия с нулевой активностью по выбранным компонентам попала бы в знаменатель,
+  // но не в числитель, занижая avgSession.
   const sessInHour = Array.from({ length: H }, () => new Set());
   const allSessions = new Set();
   for (const i of idxs) {
@@ -713,8 +715,10 @@ function computeMetrics(idxs) {
     const t = cellTok(i, comps);
     costHour[hi] += cellCost(i, comps);
     tokHour[hi] += t;
-    allSessions.add(r.sessionIdx[i]);
-    if (t > 0) sessInHour[hi].add(r.sessionIdx[i]);
+    if (t > 0) {
+      allSessions.add(r.sessionIdx[i]);
+      sessInHour[hi].add(r.sessionIdx[i]);
+    }
   }
   const byHour = { cost: costHour, tokens: tokHour };
   const activeIdx = [];
@@ -1021,7 +1025,11 @@ function chart(d, m) {
   // размерности, что и столбики), а не пересчитываем avgActive обратно в часы —
   // средний размер активного бакета (последний может быть неполным) не совпадает
   // с bucketSize, так что домножение на bucketSize было бы неточным.
-  const avgY = avgLineY(bucketSize, m, series, hours, offset, avgMode);
+  // hours — забакеченный массив (длина = число бакетов), а знаменатель сессии
+  // (sessionsPerHour) — сырой почасовой (длина H), поэтому в avgLineY идёт
+  // DATA.hours, как и в altSeries выше; иначе bucketizeSeries считал бы границы
+  // по длине бакетов и индексировал бы сырой массив неверно.
+  const avgY = avgLineY(bucketSize, m, series, DATA.hours, offset, avgMode);
   const avgLabel = avgMode === 'session'
     ? `среднее на сессию за ${BUCKET_UNIT_LABEL[bucketSize]}`
     : `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
