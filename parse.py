@@ -84,11 +84,16 @@ def _session_id(path: str, marker: str, offset: int) -> str:
     поэтому срезаем расширение, чтобы оба отображались на одну сессию.
     Codex не использует этот хелпер: его сессия — сам rollout-файл (см. parse_codex)."""
     parts = path.split(os.sep)
-    if marker in parts:
-        i = parts.index(marker)
-        j = i + offset
-        if j < len(parts):
-            return os.path.splitext(parts[j])[0]
+    # Якорь — каталог ".claude": "projects" идёт сразу после него, а не первый
+    # "projects" в пути. Иначе домашний каталог, сам названный projects
+    # (например /Users/projects/axisrow/...), сдвигал бы индекс и схлопывал все
+    # Claude-сессии в одно значение ".claude".
+    if ".claude" in parts:
+        i = parts.index(".claude") + 1
+        if i < len(parts) and parts[i] == marker:
+            j = i + offset
+            if j < len(parts):
+                return os.path.splitext(parts[j])[0]
     return "unknown"
 
 

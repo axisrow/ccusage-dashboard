@@ -938,11 +938,9 @@ function legend(d) {
 // «активного часа» знаменатель 1 (среднее по бакетам), для «на сессию» — число
 // сессия-часов в бакете (бакетизируется через bucketizeSeries). Оба режима —
 // частные случаи одного «среднее по бакетам с знаменателем», поэтому одна функция.
-function avgLineY(bucketSize, m, series, hours, offset, mode) {
+function avgLineY(bucketSize, m, series, hours, offset, mode, sessPerBucket) {
   if (bucketSize === HOUR)
     return m.metrics[unit][mode === 'session' ? 'avgSessionPerActiveHour' : 'avgActive'];
-  const sessPerBucket = mode === 'session'
-    ? sessionsPerBucket(bucketSize, offset) : null;
   const per = [];
   for (let bi = 0; bi < series.length; bi++) {
     const d = sessPerBucket ? sessPerBucket[bi] : 1;
@@ -968,8 +966,10 @@ function chart(d, m) {
   // В режиме «сессия» столбики показывают расход на сессию в бакете, а не сумму
   // бакета: иначе переключатель менял бы только линию среднего, и график «не
   // перестраивался» бы с точки зрения пользователя. Нормируем series/grid/altSeries
-  // на число сессия-часов в бакете. Линия среднего (avgLineY) считает по СЫРОМУ
-  // series, поэтому нормировка делается после неё, а здесь храним оба варианта.
+  // на число УНИКАЛЬНЫХ сессий в бакете (sessionsPerBucket; для HOUR — sessionsPerHour).
+  // Линия среднего (avgLineY) считает по СЫРОМУ series, поэтому нормировка делается
+  // после неё, а здесь храним оба варианта. sessPerBucket считается ОДИН раз и
+  // передаётся в avgLineY — иначе каждый вызов делал бы полный проход по raw.
   const sessPerBucket = avgMode === 'session'
     ? (bucketSize === HOUR ? m.sessionsPerHour : sessionsPerBucket(bucketSize, offset)) : null;
   const dispSeries = sessPerBucket
@@ -1065,10 +1065,11 @@ function chart(d, m) {
   // средний размер активного бакета (последний может быть неполным) не совпадает
   // с bucketSize, так что домножение на bucketSize было бы неточным.
   // hours — забакеченный массив (длина = число бакетов), а знаменатель сессии
-  // (sessionsPerHour) — сырой почасовой (длина H), поэтому в avgLineY идёт
+  // (sessionsPerBucket) — сырой почасовой (длина H), поэтому в avgLineY идёт
   // DATA.hours, как и в altSeries выше; иначе bucketizeSeries считал бы границы
-  // по длине бакетов и индексировал бы сырой массив неверно.
-  const avgY = avgLineY(bucketSize, m, series, DATA.hours, offset, avgMode);
+  // по длине бакетов и индексировал бы сырой массив неверно. sessPerBucket уже
+  // посчитан выше (один проход) и передаётся готовым.
+  const avgY = avgLineY(bucketSize, m, series, DATA.hours, offset, avgMode, sessPerBucket);
   const avgLabel = avgMode === 'session'
     ? `среднее на сессию за ${BUCKET_UNIT_LABEL[bucketSize]}`
     : `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
@@ -1142,10 +1143,11 @@ function table(d, m) {
     .filter(r => r[1] > 0 || r[2] > 0).sort((a, b) => b[1] - a[1] || b[2] - a[2]);
   const total = main.reduce((a, b) => a + b, 0);
   // Знаменатель столбца «За активный час»/«За сессию» — глобальный, как и раньше
-  // (активные часы), но в режиме «сессия» — сессия-часы (Σ уникальных сессий по
-  // активным часам), тот же знаменатель, что у линии среднего на графике и у
-  // тайла «на сессию в активном часу» (avgSessionPerActiveHour).
-  const denom = avgMode === 'session' ? Math.max(m.totalSessionHours, 1) : Math.max(m.activeHours, 1);
+  // (активные часы), но в режиме «сессия» — число УНИКАЛЬНЫХ сессий за период
+  // (totalSessions), тот же знаменатель, что у тайла «на сессию за период»
+  // (avgSession). Не totalSessionHours: сессия, активная 8 часов, считалась бы
+  // 8 раз, и столбец «За сессию» расходился бы с тайлом в 8 раз.
+  const denom = avgMode === 'session' ? Math.max(m.totalSessions, 1) : Math.max(m.activeHours, 1);
   const rateLabel = avgMode === 'session' ? 'За сессию' : 'За активный час';
   const otherLabel = isCost() ? 'Токенов' : 'Стоимость';
   const fmtOther = v => isCost() ? compactTok(v) : money2(v);
