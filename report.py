@@ -527,6 +527,31 @@ function bucketize(hours, grid, series, bucketSize, offset) {
   return { hours: outHours, grid: outGrid, series: outSeries };
 }
 
+// Индекс бакета для часа hi — обратная к bucketBounds. virtualStart — та же
+// формула, что в bucketBounds/bucketCount (см. их комментарий).
+function bucketIndex(hi, bucketSize, offset) {
+  const virtualStart = offset > 0 ? offset - bucketSize : 0;
+  return Math.floor((hi - virtualStart) / bucketSize);
+}
+
+// Число УНИКАЛЬНЫХ сессий в каждом бакете (для DAY/WEEK). В отличие от
+// bucketizeSeries(hours, m.sessionsPerHour, ...) — который СУММИРУЕТ сессия-часы
+// и считает сессию, активную 8 часов одного дня, 8 раз — здесь сессия считается
+// один раз на бакет, если у неё есть ненулевая активность в любом часу бакета.
+// Это и есть знаменатель «на сессию» для дневных/недельных столбиков и линии
+// среднего. Правило активности то же, что в computeMetrics (t > 0).
+function sessionsPerBucket(bucketSize, offset) {
+  const r = DATA.raw, H = DATA.hours.length;
+  const n = bucketCount(bucketSize, offset, H);
+  const sets = Array.from({ length: n }, () => new Set());
+  const comps = activeComps();
+  for (const i of filteredIndexes()) {
+    if (cellTok(i, comps) <= 0) continue;
+    sets[bucketIndex(r.hourIdx[i], bucketSize, offset)].add(r.sessionIdx[i]);
+  }
+  return sets.map(s => s.size);
+}
+
 let dim = 'tool';                        // tool | model | agent | project | components
 let unit = 'cost';                       // cost | tokens
 let bucketSizeMode = 'auto';             // 'auto' | 'hour' | 'day' | 'week' — ключ кнопки грануляции, как dim/unit
@@ -917,7 +942,7 @@ function avgLineY(bucketSize, m, series, hours, offset, mode) {
   if (bucketSize === HOUR)
     return m.metrics[unit][mode === 'session' ? 'avgSessionPerActiveHour' : 'avgActive'];
   const sessPerBucket = mode === 'session'
-    ? bucketizeSeries(hours, m.sessionsPerHour, bucketSize, offset) : null;
+    ? sessionsPerBucket(bucketSize, offset) : null;
   const per = [];
   for (let bi = 0; bi < series.length; bi++) {
     const d = sessPerBucket ? sessPerBucket[bi] : 1;
@@ -946,7 +971,7 @@ function chart(d, m) {
   // на число сессия-часов в бакете. Линия среднего (avgLineY) считает по СЫРОМУ
   // series, поэтому нормировка делается после неё, а здесь храним оба варианта.
   const sessPerBucket = avgMode === 'session'
-    ? bucketizeSeries(DATA.hours, m.sessionsPerHour, bucketSize, offset) : null;
+    ? (bucketSize === HOUR ? m.sessionsPerHour : sessionsPerBucket(bucketSize, offset)) : null;
   const dispSeries = sessPerBucket
     ? series.map((v, bi) => sessPerBucket[bi] > 0 ? v / sessPerBucket[bi] : 0) : series;
   const dispGrid = sessPerBucket
