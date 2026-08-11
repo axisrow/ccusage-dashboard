@@ -940,7 +940,21 @@ function chart(d, m) {
   // O(hours*S) на agregацию неиспользуемой разбивки по сериям).
   const altUnit = isCost() ? 'tokens' : 'cost';
   const altSeries = bucketizeSeries(DATA.hours, m.byHour[altUnit], bucketSize, offset);
-  curBucket = { hours, grid, series, altSeries, names: d.names, bucketSize, offset };
+  // В режиме «сессия» столбики показывают расход на сессию в бакете, а не сумму
+  // бакета: иначе переключатель менял бы только линию среднего, и график «не
+  // перестраивался» бы с точки зрения пользователя. Нормируем series/grid/altSeries
+  // на число сессия-часов в бакете. Линия среднего (avgLineY) считает по СЫРОМУ
+  // series, поэтому нормировка делается после неё, а здесь храним оба варианта.
+  const sessPerBucket = avgMode === 'session'
+    ? bucketizeSeries(DATA.hours, m.sessionsPerHour, bucketSize, offset) : null;
+  const dispSeries = sessPerBucket
+    ? series.map((v, bi) => sessPerBucket[bi] > 0 ? v / sessPerBucket[bi] : 0) : series;
+  const dispGrid = sessPerBucket
+    ? grid.map((row, bi) => { const d = sessPerBucket[bi]; return d > 0 ? row.map(v => v / d) : row.map(() => 0); })
+    : grid;
+  const dispAlt = sessPerBucket
+    ? altSeries.map((v, bi) => sessPerBucket[bi] > 0 ? v / sessPerBucket[bi] : 0) : altSeries;
+  curBucket = { hours, grid: dispGrid, series: dispSeries, altSeries: dispAlt, names: d.names, bucketSize, offset };
   const L = 62, R = 44, T = 12, B = 46, H = 300;   // R с запасом под последнюю подпись оси
 
   // Ширина столбика — от реальной ширины контейнера, а не от фиксированных
@@ -961,7 +975,7 @@ function chart(d, m) {
   const gap = step - minBw > 6 ? 2 : 1;
   const bw = Math.max(minBw, Math.min(20, step - gap));
   const W = L + R + hours.length * (bw + gap);
-  const max = Math.max(...series, isCost() ? 0.01 : 1);
+  const max = Math.max(...dispSeries, isCost() ? 0.01 : 1);
 
   // округляем верх шкалы до «чистого» числа
   const pow = Math.pow(10, Math.floor(Math.log10(max)));
@@ -979,7 +993,7 @@ function chart(d, m) {
   hours.forEach((h, hi) => {
     const x = L + hi * (bw + gap);
     let acc = 0;
-    grid[hi].forEach((v, si) => {
+    dispGrid[hi].forEach((v, si) => {
       if (v <= 0) return;
       const y0 = y(acc + v), y1 = y(acc);
       const hgt = Math.max(y1 - y0, .6);
