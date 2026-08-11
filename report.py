@@ -273,6 +273,7 @@ TEMPLATE = """<!doctype html>
   svg { display: block; }
   .tick { fill: var(--muted); font-size: 11px; }
   .gridline { stroke: var(--grid); stroke-width: 1; }
+  .dayline { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 3 3; }
   .avgline { stroke: var(--ink-2); stroke-width: 2; stroke-dasharray: 5 4; }
   .avglabel { fill: var(--ink-2); font-size: 11px; font-weight: 500; }
   .pie-title { font-size: 17px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
@@ -405,6 +406,10 @@ const money = n => {
 };
 const hourLabel = h => h.slice(8, 10) + '.' + h.slice(5, 7) + ' ' + h.slice(11) + ':00';
 const dayLabel = h => h.slice(8, 10) + '.' + h.slice(5, 7);
+// Полночь на наивной почасовой сетке DATA.hours (ровно 24 записи на сутки, без
+// сдвига на DST — см. комментарий у bucketOffset). Единый источник определения
+// границы суток и для bucketOffset, и для пунктиров dayline.
+const isMidnight = h => h.slice(11) === '00';
 const escapeHtml = s => String(s).replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const average = xs => xs.length ? xs.reduce((a, v) => a + v, 0) / xs.length : 0;
@@ -435,7 +440,7 @@ function pickBucketSize(hoursLen) {
 function bucketOffset(allHours, bucketSize) {
   if (bucketSize === HOUR || !allHours.length) return 0;
   let i = 0;
-  while (i < allHours.length && allHours[i].slice(11) !== '00') i++;   // первая полночь в сетке
+  while (i < allHours.length && !isMidnight(allHours[i])) i++;   // первая полночь в сетке
   if (bucketSize === DAY) return i;
   while (i < allHours.length && new Date(allHours[i].slice(0, 10) + 'T00:00:00').getDay() !== 1) i += DAY;
   return i;
@@ -895,6 +900,22 @@ function chart(d, m) {
       acc += v;
     });
   });
+
+  // Вертикальные пунктиры на границах календарных суток (полночь) — при почасовой
+  // грануляции, чтобы дни читались визуально. Рисуются ПОСЛЕ столбиков (поверх них):
+  // иначе непрозрачный столбик часа "00" (граница суток лежит на его левом крае)
+  // закрашивал бы линию, и разделитель был бы виден только при пустом полуночном
+  // бакете. hours при HOUR — исходный почасовой массив DATA.hours; новый день
+  // начинается с часа "00". hi > 0: если данные начинаются ровно в полночь, линия
+  // на левой рамке области не нужна.
+  if (bucketSize === HOUR) {
+    hours.forEach((h, hi) => {
+      if (hi > 0 && isMidnight(h)) {
+        const x = L + hi * (bw + gap);
+        s += `<line class="dayline" x1="${x}" y1="${T}" x2="${x}" y2="${T + H}"/>`;
+      }
+    });
+  }
 
   // подписи оси X — разрежённые, чтобы не наезжали друг на друга.
   // Последнюю пропускаем, если она не помещается целиком: обрезанный текст хуже отсутствующего.
