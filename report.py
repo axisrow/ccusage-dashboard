@@ -427,6 +427,13 @@ function pickBucketSize(hoursLen) {
   if (hoursLen > DAY * 10) return DAY;    // дольше ~10 дней -> дни
   return HOUR;
 }
+// Грануляция для текущего рендера: ручной выбор (bucketSizeMode) или авто по
+// длине периода (pickBucketSize). Ключ кнопки ('hour'/'day'/'week') переводится
+// в размер бакета здесь — единственное место конвертации из строки в число.
+const BUCKET_SIZE = { hour: HOUR, day: DAY, week: WEEK };
+function resolveBucketSize() {
+  return bucketSizeMode === 'auto' ? pickBucketSize(DATA.hours.length) : BUCKET_SIZE[bucketSizeMode];
+}
 
 // Смещение первого бакета, чтобы границы DAY/WEEK совпадали с календарными
 // (полночь / понедельник), а не с часом первой записи в данных. Без этого
@@ -514,6 +521,7 @@ function bucketize(hours, grid, series, bucketSize, offset) {
 
 let dim = 'tool';                        // tool | model | agent | project | components
 let unit = 'cost';                       // cost | tokens
+let bucketSizeMode = 'auto';             // 'auto' | 'hour' | 'day' | 'week' — ключ кнопки грануляции, как dim/unit
 const FILTER_DIMS = ['tool', 'model', 'agent', 'project'];
 const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set(), components: new Set() };
 
@@ -743,6 +751,11 @@ function controls() {
     Object.entries(DATA.dimLabels).map(([k, label]) =>
       `<button data-dim="${k}" aria-pressed="${k === dim}">${label}</button>`).join('') +
     `<button data-dim="components" aria-pressed="${dim === 'components'}">${COMP_DIM_LABEL}</button>` +
+    '<span style="color:var(--muted);font-size:12px">Грануляция:</span>' +
+    `<button data-bucket="auto" aria-pressed="${bucketSizeMode === 'auto'}">Авто</button>` +
+    `<button data-bucket="hour" aria-pressed="${bucketSizeMode === 'hour'}">Час</button>` +
+    `<button data-bucket="day" aria-pressed="${bucketSizeMode === 'day'}">День</button>` +
+    `<button data-bucket="week" aria-pressed="${bucketSizeMode === 'week'}">Неделя</button>` +
     '<span style="flex:1"></span>' +
     '<span style="color:var(--muted);font-size:12px">Единицы:</span>' +
     `<button data-unit="cost" aria-pressed="${unit === 'cost'}">$</button>` +
@@ -751,6 +764,16 @@ function controls() {
     b.onclick = () => { dim = b.dataset.dim; render(); });
   document.querySelectorAll('#controls button[data-unit]').forEach(b =>
     b.onclick = () => { unit = b.dataset.unit; render(); });
+  // Грануляция влияет только на график (ось X) — тайлы, таблицу и пирог она не
+  // затрагивает, поэтому перерисовываем лишь chart() поверх кэша curD/curM и
+  // точечно подсвечиваем активную кнопку, а не весь render().
+  document.querySelectorAll('#controls button[data-bucket]').forEach(b =>
+    b.onclick = () => {
+      bucketSizeMode = b.dataset.bucket;
+      document.querySelectorAll('#controls button[data-bucket]').forEach(x =>
+        x.setAttribute('aria-pressed', String(x.dataset.bucket === bucketSizeMode)));
+      if (curD && curM) chart(curD, curM);
+    });
 }
 
 // Одна группа фильтра: заголовок, «Все/Сброс», поиск, чекбоксы. opts — значения
@@ -837,7 +860,7 @@ function legend(d) {
 }
 
 function chart(d, m) {
-  const bucketSize = pickBucketSize(DATA.hours.length);
+  const bucketSize = resolveBucketSize();
   const offset = bucketOffset(DATA.hours, bucketSize);
   const b = bucketize(DATA.hours, d.grid[unit], m.byHour[unit], bucketSize, offset);
   // hours ниже — забакеченный массив (длина = число бакетов), для итерации баров/тиков.
