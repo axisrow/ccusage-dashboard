@@ -114,6 +114,11 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     tools, models, agents, projects = (
         dim_values["tool"], dim_values["model"], dim_values["agent"], dim_values["project"]
     )
+    # Сессии не входят в DIMENSIONS (это не измерение-фильтр), но нужны в ключе
+    # агрегации и как параллельный массив sessionIdx: иначе на клиенте нельзя
+    # считать уникальные сессии в час. Ключ — пара (tool, session): имя каталога
+    # сессии уникально лишь в рамках инструмента, а кортеж не требует разделителя.
+    session_idx = {s: i for i, s in enumerate(sorted({(r.tool, r.session) for r in rows}))}
     hour_idx = {h: i for i, h in enumerate(hours)}
 
     # cell = [(5 токен-компонентов), (5 денежных компонентов)] — единый источник
@@ -123,6 +128,7 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     for r in rows:
         key = (
             hour_idx[r.hour],
+            session_idx[(r.tool, r.session)],
             *(dim_idx[dim][key_fn(r)] for dim, (_, key_fn) in DIMENSIONS.items()),
         )
         tok_comp, cost_comp = components_of(r)
@@ -137,11 +143,12 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
 
     # Параллельные плоские массивы вместо списка кортежей на запись — компактнее
     # в JSON и тривиально разбираются в JS.
-    h_a, t_a, m_a, a_a, p_a = [], [], [], [], []
+    h_a, s_a, t_a, m_a, a_a, p_a = [], [], [], [], [], []
     tok_arrs = {k: [] for k in COMPONENT_KEYS}
     cost_arrs = {k: [] for k in COMPONENT_KEYS}
-    for (h, t, m, a, p), (tok_comp, cost_comp) in cells.items():
+    for (h, s, t, m, a, p), (tok_comp, cost_comp) in cells.items():
         h_a.append(h)
+        s_a.append(s)
         t_a.append(t)
         m_a.append(m)
         a_a.append(a)
@@ -156,6 +163,7 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
         "agents": agents,
         "projects": projects,
         "hourIdx": h_a,
+        "sessionIdx": s_a,
         "toolIdx": t_a,
         "modelIdx": m_a,
         "agentIdx": a_a,
@@ -694,14 +702,27 @@ function computeMetrics(idxs) {
   const r = DATA.raw, H = DATA.hours.length;
   const comps = activeComps();
   const costHour = new Array(H).fill(0), tokHour = new Array(H).fill(0);
+  // Уникальные сессии в каждом часу — та же «активность», что и tokHour (comps):
+  // сессия «в часу», если у неё есть ячейка с ненулевой активностью под фильтром.
+  // totalSessions собирается в том же цикле (все отфильтрованные сессии за период).
+  const sessInHour = Array.from({ length: H }, () => new Set());
+  const allSessions = new Set();
   for (const i of idxs) {
-    costHour[r.hourIdx[i]] += cellCost(i, comps);
-    tokHour[r.hourIdx[i]] += cellTok(i, comps);
+    const hi = r.hourIdx[i];
+    const t = cellTok(i, comps);
+    costHour[hi] += cellCost(i, comps);
+    tokHour[hi] += t;
+    allSessions.add(r.sessionIdx[i]);
+    if (t > 0) sessInHour[hi].add(r.sessionIdx[i]);
   }
   const byHour = { cost: costHour, tokens: tokHour };
   const activeIdx = [];
   tokHour.forEach((v, i) => { if (v > 0) activeIdx.push(i); });
   const nActive = activeIdx.length || 1;
+  // сессия-часы = Σ уникальных сессий по активным часам; totalSessions = число
+  // уникальных сессий среди отфильтрованных ячеек за период.
+  const totalSessionHours = activeIdx.reduce((s, h) => s + sessInHour[h].size, 0);
+  const totalSessions = allSessions.size;
   const metrics = {};
   for (const u of ['cost', 'tokens']) {
     const series = byHour[u];
@@ -709,10 +730,16 @@ function computeMetrics(idxs) {
     const peak = series.length ? Math.max(...series) : 0;
     metrics[u] = {
       grand, avgActive: grand / nActive, avgCalendar: grand / H,
+      // Нормализация на сессию: avgSessionPerActiveHour = расход на сессию за
+      // активный час с учётом параллельности (Σ сессий по активным часам);
+      // avgSession = средний расход одной сессии за весь период.
+      avgSessionPerActiveHour: totalSessionHours ? grand / totalSessionHours : 0,
+      avgSession: totalSessions ? grand / totalSessions : 0,
       peak, peakHour: series.length && peak > 0 ? DATA.hours[series.indexOf(peak)] : '',
     };
   }
-  return { byHour, metrics, activeHours: activeIdx.length, calendarHours: H, records: idxs.length };
+  return { byHour, metrics, activeHours: activeIdx.length, calendarHours: H,
+    totalSessions, totalSessionHours, records: idxs.length };
 }
 
 function tiles(m) {
@@ -725,6 +752,10 @@ function tiles(m) {
     ['Пик за час', compact(mu.peak), mu.peakHour ? hourLabel(mu.peakHour) : ''],
     [isCost() ? 'Всего' : 'Всего токенов', compact(mu.grand),
      fmtInt(DATA.rawRecords) + ' записей за период'],
+    [what + ' в среднем на сессию в активном часу', compact(mu.avgSessionPerActiveHour),
+     m.totalSessions + ' сессий · ' + m.totalSessionHours + ' сессия-часов'],
+    [what + ' в среднем за сессию', compact(mu.avgSession),
+     m.totalSessions + ' сессий за период'],
   ];
   document.getElementById('tiles').innerHTML = items.map(([l, v, n]) =>
     `<div><div class="tile-label">${l}</div><div class="tile-value">${v}</div>` +
