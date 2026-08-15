@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 
-from parse import collect, normalize_date
+from parse import TOOLS, collect, normalize_date
 from pricing import load as load_rates, run_ccusage
 
 COMPONENTS = (
@@ -37,10 +37,18 @@ COMPONENTS = (
 # ($20.32 против $20.35), тогда как против auto было бы -9%.
 CODEX_ARGS = ("--speed", "standard")
 
+# ZCode не хранит стоимость в своей базе, поэтому ccusage считает её из прайса.
+# --offline берёт встроенную цену GLM-5.2 вместо похода в LiteLLM: сверка не
+# должна зависеть от сети и от того, обновился ли там прайс.
+ZCODE_ARGS = ("--offline",)
+
+TOOL_ARGS = {"codex": CODEX_ARGS, "zcode": ZCODE_ARGS}
+
 
 def mine(tool: str, since: str, until: str) -> dict:
     rows = collect(since=since, until=until, tools=(tool,))
     rates = load_rates()
+    resolved = {m: rates.get(m) for m in {r.model for r in rows}}
     out = {name: 0 for name, _ in COMPONENTS}
     out["_cost"] = 0.0
     out["_unpriced"] = 0
@@ -49,7 +57,7 @@ def mine(tool: str, since: str, until: str) -> dict:
         out["output"] += r.output
         out["cache_create"] += r.cache_create
         out["cache_read"] += r.cache_read
-        rate = rates.get(r.model)
+        rate = resolved[r.model]
         if rate is None:
             out["_unpriced"] += r.total
         else:
@@ -65,15 +73,23 @@ def theirs(data: dict) -> dict[str, int]:
     return {name: int(totals.get(key, 0) or 0) for name, key in COMPONENTS}
 
 
-def compare(tool: str, since: str, until: str, threshold: float) -> bool:
+def compare(tool: str, since: str, until: str, threshold: float) -> bool | None:
+    """True/False — сверка прошла/провалена. None — ccusage не смог сверить (пропущено, не ok и не fail)."""
     print(f"\n{'=' * 66}\n{tool.upper()}  {since} .. {until}\n{'=' * 66}")
 
     my = mine(tool, since, until)
-    data = run_ccusage(tool, since, until, CODEX_ARGS if tool == "codex" else ())
+    data = run_ccusage(tool, since, until, TOOL_ARGS.get(tool, ()))
     if data is None:
-        print("  ccusage недоступен — сверка пропущена.")
+        if tool == "zcode":
+            print(
+                "  ccusage не поддержал команду zcode — сверка НЕ проведена (не пройдена, не провалена)."
+            )
+            print("  Опубликованный ccusage команду zcode не понимает; нужна сборка из форка,")
+            print("  путь к ней передаётся через CCUSAGE_BIN (см. CLAUDE.md).")
+        else:
+            print("  ccusage недоступен — сверка пропущена.")
         print(f"  мой парсер: {sum(v for k, v in my.items() if not k.startswith('_')):,} токенов")
-        return True
+        return None
 
     cc = theirs(data)
     print(f"{'компонент':<16} {'мой парсер':>17} {'ccusage':>17} {'расхождение':>13}")
@@ -127,7 +143,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Сверка парсера с ccusage")
     ap.add_argument("--since", required=True, help="дата начала, YYYY-MM-DD или YYYYMMDD")
     ap.add_argument("--until", required=True, help="дата конца, включительно")
-    ap.add_argument("--tool", choices=["claude", "codex"], action="append")
+    ap.add_argument("--tool", choices=list(TOOLS), action="append")
     ap.add_argument("--threshold", type=float, default=1.0, help="порог расхождения в %% (по умолчанию 1)")
     args = ap.parse_args()
 
@@ -136,11 +152,18 @@ def main() -> None:
     print("ccusage сканирует все логи целиком — это займёт минуту-другую.")
 
     all_ok = True
-    for tool in args.tool or ("claude", "codex"):
-        if not compare(tool, since, until, args.threshold):
+    skipped = []
+    for tool in args.tool or TOOLS:
+        result = compare(tool, since, until, args.threshold)
+        if result is None:
+            skipped.append(tool)
+        elif not result:
             all_ok = False
 
     print()
+    if skipped:
+        print(f"Не сверено (ccusage недоступен/не поддержал команду): {', '.join(skipped)}.")
+        print("Расхождение для этих инструментов не подтверждено и не опровергнуто.")
     raise SystemExit(0 if all_ok else 1)
 
 

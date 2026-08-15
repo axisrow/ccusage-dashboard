@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -177,8 +178,11 @@ def run_ccusage(tool: str, since: str, until: str, extra_args: tuple = ()) -> di
     ccusage <tool> daily --json. Возвращает None, если инструмент недоступен.
 
     Если ccusage не установлен глобально, пробуем bunx — так его обычно и держат.
+    CCUSAGE_BIN указывает на конкретный бинарь: команду zcode понимает пока лишь
+    сборка из форка, в опубликованной версии её ещё нет.
     """
-    cmd = ["ccusage", tool, "daily", "--json", "--since", since, "--until", until, *extra_args]
+    binary = os.environ.get("CCUSAGE_BIN") or "ccusage"
+    cmd = [binary, tool, "daily", "--json", "--since", since, "--until", until, *extra_args]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=600)
     except FileNotFoundError:
@@ -346,7 +350,14 @@ def build(
         # отчитался о нулевой стоимости при ненулевых токенах.
         zero_cost = bool(rows) and total_cost == 0
 
-        canonical = canonical_name(model)
+        # ALIASES/FALLBACK/LiteLLM все ключуются в нижнем регистре, а имя модели
+        # в логах — нет (ZCode пишет «GLM-5.2», ставка лежит под «glm-5.2»,
+        # ловушка 13 в CLAUDE.md). RateTable.__missing__ доводит регистр при
+        # ЧТЕНИИ, но это не спасает, если ставка не была СОХРАНЕНА ни под одним
+        # из вариантов регистра — здесь тот же регистронезависимый резолв нужен
+        # и при построении таблицы, иначе модель, встреченная только в «чужом»
+        # регистре, останется без цены.
+        canonical = canonical_name(model.lower())
         # 1. LiteLLM — основной источник, он же приоритетнее нулей от ccusage.
         # Нулевой cost НЕ означает бесплатность: ccusage отдаёт 0, пока не знает
         # цену новой модели. На проверке claude-opus-5 показывал $0, а после
@@ -394,14 +405,39 @@ def save(table: dict[str, Rates]) -> None:
     )
 
 
-def load() -> dict[str, Rates]:
+class RateTable(dict):
+    """Таблица ставок, которая сама доводит имя модели до ключа прайса.
+
+    Имя в логах не совпадает с ключом побуквенно: ZCode пишет «GLM-5.2», а
+    ставка лежит под «glm-5.2». Резолв — свойство таблицы, а не обязанность
+    каждого потребителя: обычные `table[model]`, `table.get(model)` и
+    `model in table` уже учитывают регистр и алиасы. Иначе любой, кто напишет
+    привычный `rates.get(model)`, молча получит строку без цены при живой ставке.
+    """
+
+    def __missing__(self, model: str) -> Rates | None:
+        for name in (canonical_name(model), model.lower(), canonical_name(model.lower())):
+            rates = dict.get(self, name)
+            if rates is not None:
+                return rates
+        return None
+
+    def get(self, model, default=None):  # type: ignore[override]
+        rates = self[model]
+        return default if rates is None else rates
+
+    def __contains__(self, model: object) -> bool:
+        return isinstance(model, str) and self[model] is not None
+
+
+def load() -> RateTable:
     if not CACHE.exists():
-        return {}
+        return RateTable()
     try:
         raw = json.loads(CACHE.read_text(encoding="utf-8"))
     except ValueError:
-        return {}
-    return {m: Rates.from_dict(d) for m, d in raw.items()}
+        return RateTable()
+    return RateTable((m, Rates.from_dict(d)) for m, d in raw.items())
 
 
 def describe(table: dict[str, Rates]) -> None:
