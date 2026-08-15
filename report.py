@@ -26,7 +26,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from parse import TOOLS, Row, collect, normalize_date
+from parse import TOOLS, ZCODE_ERRORS, Row, collect, normalize_date
 from pricing import load as load_rates
 from pricing import split_cache_create
 
@@ -221,6 +221,11 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
             "tokens": sum(unpriced_models.values()),
             "models": sorted(unpriced_models, key=lambda m: -unpriced_models[m])[:5],
         },
+        # Снимок ZCODE_ERRORS на момент collect(), а не build_payload() — сбои
+        # SQLite иначе долетали бы только до stderr парсера и терялись из вида,
+        # если отчёт открывают в браузере, а не читают консоль (находка Codex,
+        # cycle-review раунд 3).
+        "zcodeErrors": list(ZCODE_ERRORS),
         "subscription": sorted(
             m for m, rt in resolved.items() if rt is not None and rt.source == "subscription"
         ),
@@ -826,6 +831,9 @@ function tiles(m) {
   if (DATA.hasCodex)
     parts.push('Codex посчитан по обычному тарифу: признака fast-режима в логах нет, ' +
       'в нём цена вдвое выше.');
+  if (DATA.zcodeErrors.length)
+    parts.push('⚠ Данные ZCode неполны: ' + DATA.zcodeErrors.length +
+      ' ошибка(и) чтения базы — см. вывод сборки в консоли.');
   document.getElementById('caveat').textContent = parts.join(' ');
 }
 
@@ -1347,6 +1355,8 @@ def main() -> None:
             f"без прайсинга: {payload['unpriced']['tokens']:,} токенов "
             f"({', '.join(payload['unpriced']['models'])})"
         )
+    if payload["zcodeErrors"]:
+        print(f"⚠ данные ZCode неполны: {len(payload['zcodeErrors'])} ошибка(и) чтения базы")
     if args.open:
         webbrowser.open(out.as_uri())
 

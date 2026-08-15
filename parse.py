@@ -362,6 +362,13 @@ WHERE mu.status = 'completed'
 """
 
 
+# Заполняется в collect() при сбое чтения ZCode-базы (соединение или курсор) —
+# отдельно от stderr-принта, чтобы предупреждение могло дойти и до самого
+# сгенерированного отчёта (report.py показывает его тем же баннером, что и
+# unpriced-модели), а не только до консоли парсера.
+ZCODE_ERRORS: list[str] = []
+
+
 def parse_zcode(db_path: str) -> list[Row]:
     """
     Воркер для одной базы ZCode (ловушка 7).
@@ -375,7 +382,9 @@ def parse_zcode(db_path: str) -> list[Row]:
         # дашборд не должен её трогать на запись.
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        print(f"  zcode {db_path}: база недоступна ({exc})", file=sys.stderr)
+        msg = f"zcode {db_path}: база недоступна ({exc})"
+        print(f"  {msg}", file=sys.stderr)
+        ZCODE_ERRORS.append(msg)
         return []
 
     rows: list[Row] = []
@@ -411,7 +420,9 @@ def parse_zcode(db_path: str) -> list[Row]:
         # битую базу отдаём тем, что успели прочитать, а не роняем весь сбор —
         # но молчать об этом нельзя, иначе усечённый результат неотличим от
         # честного отсутствия расхода ZCode.
-        print(f"  zcode {db_path}: чтение прервано ({exc}), данные неполные", file=sys.stderr)
+        msg = f"zcode {db_path}: чтение прервано ({exc}), данные неполные"
+        print(f"  {msg}", file=sys.stderr)
+        ZCODE_ERRORS.append(msg)
     finally:
         con.close()
 
@@ -429,6 +440,7 @@ def collect(
     tools: Iterable[str] = TOOLS,
 ) -> list[Row]:
     """Собрать все записи за период. since/until — 'YYYY-MM-DD', границы включительно."""
+    ZCODE_ERRORS.clear()  # каждый вызов collect() — новый снимок ошибок ZCode
     tools = set(tools)
     jobs: list[tuple] = []
     if "claude" in tools:
