@@ -73,15 +73,23 @@ def theirs(data: dict) -> dict[str, int]:
     return {name: int(totals.get(key, 0) or 0) for name, key in COMPONENTS}
 
 
-def compare(tool: str, since: str, until: str, threshold: float) -> bool:
+def compare(tool: str, since: str, until: str, threshold: float) -> bool | None:
+    """True/False — сверка прошла/провалена. None — ccusage не смог сверить (пропущено, не ok и не fail)."""
     print(f"\n{'=' * 66}\n{tool.upper()}  {since} .. {until}\n{'=' * 66}")
 
     my = mine(tool, since, until)
     data = run_ccusage(tool, since, until, TOOL_ARGS.get(tool, ()))
     if data is None:
-        print("  ccusage недоступен — сверка пропущена.")
+        if tool == "zcode":
+            print(
+                "  ccusage не поддержал команду zcode — сверка НЕ проведена (не пройдена, не провалена)."
+            )
+            print("  Опубликованный ccusage команду zcode не понимает; нужна сборка из форка,")
+            print("  путь к ней передаётся через CCUSAGE_BIN (см. CLAUDE.md).")
+        else:
+            print("  ccusage недоступен — сверка пропущена.")
         print(f"  мой парсер: {sum(v for k, v in my.items() if not k.startswith('_')):,} токенов")
-        return True
+        return None
 
     cc = theirs(data)
     print(f"{'компонент':<16} {'мой парсер':>17} {'ccusage':>17} {'расхождение':>13}")
@@ -144,11 +152,18 @@ def main() -> None:
     print("ccusage сканирует все логи целиком — это займёт минуту-другую.")
 
     all_ok = True
+    skipped = []
     for tool in args.tool or TOOLS:
-        if not compare(tool, since, until, args.threshold):
+        result = compare(tool, since, until, args.threshold)
+        if result is None:
+            skipped.append(tool)
+        elif not result:
             all_ok = False
 
     print()
+    if skipped:
+        print(f"Не сверено (ccusage недоступен/не поддержал команду): {', '.join(skipped)}.")
+        print("Расхождение для этих инструментов не подтверждено и не опровергнуто.")
     raise SystemExit(0 if all_ok else 1)
 
 

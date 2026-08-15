@@ -33,6 +33,7 @@ import glob
 import json
 import os
 import sqlite3
+import sys
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -373,7 +374,8 @@ def parse_zcode(db_path: str) -> list[Row]:
         # Строго read-only: база живёт в WAL-режиме под работающим ZCode,
         # дашборд не должен её трогать на запись.
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        print(f"  zcode {db_path}: база недоступна ({exc})", file=sys.stderr)
         return []
 
     rows: list[Row] = []
@@ -405,8 +407,11 @@ def parse_zcode(db_path: str) -> list[Row]:
                     cache_read=cr,
                 )
             )
-    except sqlite3.Error:
-        pass  # битую базу отдаём тем, что успели прочитать, а не роняем весь сбор
+    except sqlite3.Error as exc:
+        # битую базу отдаём тем, что успели прочитать, а не роняем весь сбор —
+        # но молчать об этом нельзя, иначе усечённый результат неотличим от
+        # честного отсутствия расхода ZCode.
+        print(f"  zcode {db_path}: чтение прервано ({exc}), данные неполные", file=sys.stderr)
     finally:
         con.close()
 
