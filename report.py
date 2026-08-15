@@ -26,7 +26,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from parse import Row, collect, normalize_date
+from parse import TOOLS, Row, collect, normalize_date
 from pricing import load as load_rates
 from pricing import split_cache_create
 
@@ -72,10 +72,16 @@ def project_name(path: str) -> str:
     return parts[-1]
 
 
+# Как инструменты называются в подзаголовке — в логах они лежат под короткими id.
+TOOL_TITLES = {"claude": "Claude Code", "codex": "Codex", "zcode": "ZCode"}
+
+# Подписи: «Агент» — это CLI целиком (claude/codex/zcode), «Инструмент» — роль
+# внутри него (main/sidechain/сабагенты). Ключи dim остаются техническими:
+# r.tool и r.agent менять нельзя, они приходят из parse.Row.
 DIMENSIONS = {
-    "tool": ("Инструмент", lambda r: r.tool),
+    "tool": ("Агент", lambda r: r.tool),
     "model": ("Модель", lambda r: r.model),
-    "agent": ("Агент", lambda r: r.agent),
+    "agent": ("Инструмент", lambda r: r.agent),
     "project": ("Проект", lambda r: project_name(r.project)),
 }
 
@@ -177,6 +183,11 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
     hours_present = sorted({r.hour for r in rows})
     hours = hour_range(hours_present[0], hours_present[-1])
 
+    # Резолв имени в ставку стоит на порядок дороже словарного доступа (регистр,
+    # алиасы), а моделей — десятки на сотни тысяч записей. Разрешаем каждую один
+    # раз: дальше и горячий путь, и сводки читают готовый словарь.
+    resolved = {m: rates.get(m) for m in {r.model for r in rows}}
+
     def components_of(r: Row) -> tuple[tuple[int, ...], tuple[float, ...]]:
         """Токен- и денежные компоненты записи (in, out, cc5m, cc1h, cr) —
         split_cache_create делит cache_create на 5m/1h один раз, дальше токены
@@ -184,7 +195,7 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
         split_cache_create). Без ставки — токены настоящие, деньги нули."""
         cc5m, cc1h = split_cache_create(r.cache_create, r.cache_create_1h)
         tok_comp = (r.input, r.output, cc5m, cc1h, r.cache_read)
-        rate = rates.get(r.model)
+        rate = resolved[r.model]
         cost_comp = (
             rate.cost_components(r.input, r.output, r.cache_create, r.cache_read, r.cache_create_1h)
             if rate is not None else (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -195,8 +206,10 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
     # чтобы «$0» нельзя было спутать с «цена неизвестна». Это caveat про весь
     # период целиком, поэтому НЕ пересчитывается на клиенте при фильтрах.
     unpriced_models: dict[str, int] = defaultdict(int)
+    tools_present: set[str] = set()
     for r in rows:
-        if r.model not in rates:
+        tools_present.add(r.tool)
+        if resolved[r.model] is None:
             unpriced_models[r.model] += r.total
 
     return {
@@ -209,14 +222,19 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
             "models": sorted(unpriced_models, key=lambda m: -unpriced_models[m])[:5],
         },
         "subscription": sorted(
-            {m for m, rt in rates.items() if rt.source == "subscription"}
+            m for m, rt in resolved.items() if rt is not None and rt.source == "subscription"
         ),
-        "hasCodex": any(r.tool == "codex" for r in rows),
+        "hasCodex": "codex" in tools_present,
+        # Подзаголовок перечисляет только те источники, что реально попали в выборку
+        # (--tool и период могут оставить один), поэтому список строится по данным.
+        "sources": [TOOL_TITLES.get(t, t) for t in TOOLS if t in tools_present],
         "dimLabels": {dim: label for dim, (label, _) in DIMENSIONS.items()},
         "palette": PALETTE,
         "otherColor": OTHER_COLOR,
         # Ставки по компонентам для показа в таблице (Rates.as_dict — те же поля).
-        "rates": {m: rt.as_dict() for m, rt in rates.items()},
+        # Ключи — имена моделей ровно как в логах: JS ищет их точным совпадением,
+        # а регистр в логах и в прайсе расходится (ZCode пишет «GLM-5.2»).
+        "rates": {m: rt.as_dict() for m, rt in resolved.items() if rt is not None},
         "componentPalette": PALETTE[:5],
         "raw": build_raw(rows, hours, components_of),
     }
@@ -1257,7 +1275,7 @@ function render() {
 }
 
 document.getElementById('subtitle').textContent =
-  `${DATA.dateFrom} — ${DATA.dateTo} · локальное время · источники: Claude Code, Codex`;
+  `${DATA.dateFrom} — ${DATA.dateTo} · локальное время · источники: ${DATA.sources.join(', ')}`;
 controls(); renderFilterGroups(); render();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
 
@@ -1282,7 +1300,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Почасовой дашборд расхода токенов")
     ap.add_argument("--since", help="дата начала, YYYY-MM-DD или YYYYMMDD")
     ap.add_argument("--until", help="дата конца, включительно")
-    ap.add_argument("--tool", choices=["claude", "codex"], action="append")
+    ap.add_argument("--tool", choices=list(TOOLS), action="append")
     ap.add_argument("--out", default="dashboard.html", help="куда сохранить HTML")
     ap.add_argument("--open", action="store_true", help="открыть в браузере")
     args = ap.parse_args()
@@ -1290,11 +1308,14 @@ def main() -> None:
     rows = collect(
         since=normalize_date(args.since),
         until=normalize_date(args.until),
-        tools=args.tool or ("claude", "codex"),
+        tools=args.tool or TOOLS,
     )
     if not rows:
         print("За указанный период записей не найдено — дашборд не создан.")
-        print("Проверьте --since/--until или наличие логов в ~/.claude/projects и ~/.codex/sessions.")
+        print(
+            "Проверьте --since/--until или наличие логов в ~/.claude/projects, "
+            "~/.codex/sessions и ~/.zcode/cli/db/db.sqlite."
+        )
         raise SystemExit(1)
 
     rates = load_rates()

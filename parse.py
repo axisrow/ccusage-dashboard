@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-parse.py — быстрый сбор расхода токенов из локальных логов Claude Code и Codex.
+parse.py — быстрый сбор расхода токенов из локальных логов Claude Code, Codex и ZCode.
 
 Зачем не ccusage: он сканирует все логи целиком (~6 ГБ) независимо от --since —
 49 с за два дня, больше двух минут за полный период. Этот парсер читает всю
@@ -19,6 +19,9 @@ parse.py — быстрый сбор расхода токенов из лока
      но и он дублируется — дедуп по кумулятивному ключу.
   5. Модель Codex лежит в turn_context, а не в session_meta.
   6. payload.source у Codex бывает объектом (подагенты guardian/review).
+  7. ZCode хранит расход не в jsonl, а в SQLite ~/.zcode/cli/db/db.sqlite, и его
+     input_tokens ВКЛЮЧАЕТ обе части кэша — свежий input добывается вычитанием.
+     started_at там в миллисекундах, а reasoning_tokens уже входит в output.
 
 Только stdlib, Python 3.9+.
 """
@@ -29,6 +32,7 @@ import argparse
 import glob
 import json
 import os
+import sqlite3
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -39,8 +43,24 @@ from typing import Iterable, NamedTuple
 HOME = Path.home()
 CLAUDE_GLOB = str(HOME / ".claude/projects/**/*.jsonl")
 CODEX_GLOB = str(HOME / ".codex/sessions/**/rollout-*.jsonl")
+# ZCode — единственный источник-БД, а не набор файлов (ловушка 7). ZCODE_HOME
+# задаёт home-каталоги через запятую (так же, как в ccusage), путь к самой базе
+# внутри каждого из них фиксирован.
+ZCODE_DB_RELATIVE = "cli/db/db.sqlite"
+
+TOOLS = ("claude", "codex", "zcode")
 
 WORKERS = min(8, (os.cpu_count() or 4))
+
+
+def zcode_databases() -> list[Path]:
+    """Существующие базы ZCode. Пусто, если ZCode не установлен."""
+    raw = os.environ.get("ZCODE_HOME", "")
+    # dict.fromkeys — дедуп с сохранением порядка: один и тот же каталог, дважды
+    # названный в ZCODE_HOME, иначе удвоил бы весь расход ZCode.
+    named = dict.fromkeys(p.strip() for p in raw.split(",") if p.strip())
+    homes = [Path(p).expanduser() for p in named] or [HOME / ".zcode"]
+    return [db for home in homes if (db := home / ZCODE_DB_RELATIVE).is_file()]
 
 
 class Row(NamedTuple):
@@ -48,7 +68,7 @@ class Row(NamedTuple):
 
     hour: str  # "YYYY-MM-DDTHH" в локальной TZ
     date: str  # "YYYY-MM-DD" в локальной TZ
-    tool: str  # claude | codex
+    tool: str  # claude | codex | zcode
     model: str
     agent: str  # main / имя подагента
     project: str  # абсолютный cwd либо "unknown"
@@ -64,6 +84,13 @@ class Row(NamedTuple):
         return self.input + self.output + self.cache_create + self.cache_read
 
 
+def _parts_of(dt: datetime) -> tuple[str, str]:
+    """Локальное время -> (час, дата) в формате Row. Единственное место с этими
+    форматами: разъедься они между инструментами — записи перестанут склеиваться
+    в один часовой бакет, и это не упадёт, а тихо исказит цифры."""
+    return dt.strftime("%Y-%m-%dT%H"), dt.strftime("%Y-%m-%d")
+
+
 def _local_parts(ts: str) -> tuple[str, str] | None:
     """ISO-строка с Z -> (час, дата) в локальной таймзоне. Ловушка 1."""
     if not ts:
@@ -72,7 +99,7 @@ def _local_parts(ts: str) -> tuple[str, str] | None:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
     except ValueError:
         return None
-    return dt.strftime("%Y-%m-%dT%H"), dt.strftime("%Y-%m-%d")
+    return _parts_of(dt)
 
 
 def _session_id(path: str, marker: str, offset: int) -> str:
@@ -318,6 +345,75 @@ def parse_codex(path: str) -> list[Row]:
 
 
 # --------------------------------------------------------------------------- #
+# ZCode
+# --------------------------------------------------------------------------- #
+
+# status: строки running/error/cancelled — это незавершённые или неоплаченные
+# запросы, ccusage их тоже отбрасывает.
+ZCODE_SQL = """
+SELECT mu.model_id, mu.started_at, mu.agent, mu.session_id,
+       mu.input_tokens, mu.output_tokens,
+       mu.cache_creation_input_tokens, mu.cache_read_input_tokens,
+       s.directory
+FROM model_usage AS mu
+LEFT JOIN session AS s ON s.id = mu.session_id
+WHERE mu.status = 'completed'
+"""
+
+
+def parse_zcode(db_path: str) -> list[Row]:
+    """
+    Воркер для одной базы ZCode (ловушка 7).
+
+    Дедуп не нужен, в отличие от Claude и Codex: model_usage.id — первичный ключ,
+    одна строка = один запрос к модели, счётчики инкрементальны. Ретраи легли бы
+    отдельными строками с attempt_index > 0, но ccusage их тоже не схлопывает.
+    """
+    try:
+        # Строго read-only: база живёт в WAL-режиме под работающим ZCode,
+        # дашборд не должен её трогать на запись.
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+
+    rows: list[Row] = []
+    try:
+        for model, started, agent, session, inp, out, cc, cr, directory in con.execute(ZCODE_SQL):
+            if not started:
+                continue
+            inp, out = inp or 0, out or 0
+            cc, cr = cc or 0, cr or 0
+            # input_tokens — надмножество: включает и cache-read, и cache-write
+            fresh = max(inp - cr - cc, 0)
+            if fresh + out + cc + cr == 0:
+                continue
+
+            # started_at в миллисекундах, дальше — та же локальная TZ (ловушка 1)
+            hour, date = _parts_of(datetime.fromtimestamp(started / 1000).astimezone())
+            rows.append(
+                Row(
+                    hour=hour,
+                    date=date,
+                    tool="zcode",
+                    model=(model or "unknown").strip(),
+                    agent=agent or "main",
+                    project=directory or "unknown",
+                    session=session or "unknown",
+                    input=fresh,
+                    output=out,
+                    cache_create=cc,
+                    cache_read=cr,
+                )
+            )
+    except sqlite3.Error:
+        pass  # битую базу отдаём тем, что успели прочитать, а не роняем весь сбор
+    finally:
+        con.close()
+
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Сбор
 # --------------------------------------------------------------------------- #
 
@@ -325,7 +421,7 @@ def parse_codex(path: str) -> list[Row]:
 def collect(
     since: str | None = None,
     until: str | None = None,
-    tools: Iterable[str] = ("claude", "codex"),
+    tools: Iterable[str] = TOOLS,
 ) -> list[Row]:
     """Собрать все записи за период. since/until — 'YYYY-MM-DD', границы включительно."""
     tools = set(tools)
@@ -336,6 +432,13 @@ def collect(
         jobs.append((parse_codex, glob.glob(CODEX_GLOB, recursive=True)))
 
     rows: list[Row] = []
+    # ZCode мимо пула: это одна база на инструмент, распараллеливать нечего,
+    # а sqlite-соединение через ProcessPoolExecutor не переживёт пикла.
+    if "zcode" in tools:
+        for db in zcode_databases():
+            rows.extend(parse_zcode(str(db)))
+    before_pool = len(rows)  # граница, за которой начинается вклад пула
+
     try:
         with ProcessPoolExecutor(max_workers=WORKERS) as pool:
             for fn, files in jobs:
@@ -346,8 +449,10 @@ def collect(
     except RuntimeError:
         # collect() вызвали при импорте модуля (вне if __name__ == "__main__"):
         # на spawn-платформах пул стартовать нельзя. Считаем последовательно —
-        # медленнее в разы, но результат идентичен.
-        rows = []
+        # медленнее в разы, но результат идентичен. Пул мог успеть отдать часть
+        # чанков — отбрасываем ровно их, по границе, а не по признаку инструмента:
+        # иначе следующий не-пуловый источник тихо потеряется на этом пути.
+        del rows[before_pool:]
         for fn, files in jobs:
             for path in files:
                 rows.extend(fn(path))
@@ -393,10 +498,10 @@ def _stats(rows: list[Row], elapsed: float) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Сбор расхода токенов из логов Claude Code и Codex")
+    ap = argparse.ArgumentParser(description="Сбор расхода токенов из логов Claude Code, Codex и ZCode")
     ap.add_argument("--since", help="дата начала, YYYY-MM-DD или YYYYMMDD")
     ap.add_argument("--until", help="дата конца, включительно")
-    ap.add_argument("--tool", choices=["claude", "codex"], action="append", help="ограничить инструментом")
+    ap.add_argument("--tool", choices=list(TOOLS), action="append", help="ограничить инструментом")
     ap.add_argument("--stats", action="store_true", help="показать сводку вместо JSON")
     ap.add_argument("--json", action="store_true", help="выгрузить записи в JSON")
     args = ap.parse_args()
@@ -405,7 +510,7 @@ def main() -> None:
     rows = collect(
         since=normalize_date(args.since),
         until=normalize_date(args.until),
-        tools=args.tool or ("claude", "codex"),
+        tools=args.tool or TOOLS,
     )
     elapsed = time.time() - started
 
