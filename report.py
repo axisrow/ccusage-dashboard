@@ -20,13 +20,15 @@ validate_palette.js в обеих темах: adjacent CVD ΔE 9.1 light / 8.4 d
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import re
 import webbrowser
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from parse import TOOLS, ZCODE_ERRORS, Row, collect, normalize_date
+from parse import HOME, TOOLS, ZCODE_ERRORS, Row, collect, normalize_date, zcode_databases
 from pricing import load as load_rates
 from pricing import split_cache_create
 
@@ -81,9 +83,56 @@ TOOL_TITLES = {"claude": "Claude Code", "codex": "Codex", "zcode": "ZCode"}
 DIMENSIONS = {
     "tool": ("Агент", lambda r: r.tool),
     "model": ("Модель", lambda r: r.model),
+    "provider": ("Провайдер", lambda r: r.provider),
     "agent": ("Инструмент", lambda r: r.agent),
     "project": ("Проект", lambda r: project_name(r.project)),
 }
+
+
+def _codex_provider_names(path: Path) -> dict[str, str]:
+    """Минимально читает имена model_providers из TOML без зависимости от tomllib.
+
+    Проект поддерживает Python 3.9, где tomllib ещё нет. Нам нужны только заголовок
+    секции и строковое поле name; ключи, URL и прочие настройки не читаются.
+    """
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return {}
+    section_re = re.compile(r'^\s*\[model_providers\.(.+)]\s*$')
+    name_re = re.compile(r'^\s*name\s*=\s*(.+?)\s*$')
+    current = None
+    out: dict[str, str] = {}
+    for line in lines:
+        match = section_re.match(line)
+        if line.lstrip().startswith("["):
+            current = match.group(1).strip().strip('"\'') if match else None
+            continue
+        if current and (match := name_re.match(line)):
+            try:
+                value = ast.literal_eval(match.group(1))
+            except (ValueError, SyntaxError):
+                value = None
+            if isinstance(value, str) and value:
+                out[current] = value
+    return out
+
+
+def provider_labels(rows: list[Row]) -> dict[str, str]:
+    """Технический provider id -> безопасная подпись для интерфейса."""
+    labels = {"unknown": "Не указан в логе", "openai": "OpenAI"}
+    labels.update(_codex_provider_names(HOME / ".codex/config.toml"))
+    for db in zcode_databases():
+        config = db.parents[2] / "v2/config.json"
+        try:
+            providers = (json.loads(config.read_text()) or {}).get("provider") or {}
+        except (OSError, ValueError, TypeError):
+            continue
+        for provider_id, data in providers.items():
+            name = data.get("name") if isinstance(data, dict) else None
+            if isinstance(name, str) and name:
+                labels[provider_id] = name
+    return {provider: labels.get(provider, provider) for provider in sorted({r.provider for r in rows})}
 
 
 def hour_range(first: str, last: str) -> list[str]:
@@ -100,10 +149,10 @@ def hour_range(first: str, last: str) -> list[str]:
 
 def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     """
-    Разреженная агрегация по (час, инструмент, модель, агент, проект) —
+    Разреженная агрегация по (час, инструмент, модель, провайдер, агент, проект) —
     сырьё для клиентской фасетной фильтрации по чекбоксам.
 
-    Схлопывание по этим пяти ключам (не по строкам исходных Row) даёт на
+    Схлопывание по этим шести ключам (не по строкам исходных Row) даёт на
     порядки меньше записей — дальше группировку по любому одному измерению
     (с учётом фильтров по остальным) делает JS, а не Python: иначе на клиенте
     нет данных для пересчёта при комбинированном фильтре вида
@@ -117,8 +166,9 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     """
     dim_values = {dim: sorted({key(r) for r in rows}) for dim, (_, key) in DIMENSIONS.items()}
     dim_idx = {dim: {v: i for i, v in enumerate(vs)} for dim, vs in dim_values.items()}
-    tools, models, agents, projects = (
-        dim_values["tool"], dim_values["model"], dim_values["agent"], dim_values["project"]
+    tools, models, providers, agents, projects = (
+        dim_values["tool"], dim_values["model"], dim_values["provider"],
+        dim_values["agent"], dim_values["project"]
     )
     # Сессии не входят в DIMENSIONS (это не измерение-фильтр), но нужны в ключе
     # агрегации и как параллельный массив sessionIdx: иначе на клиенте нельзя
@@ -127,7 +177,7 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     session_idx = {s: i for i, s in enumerate(sorted({(r.tool, r.session) for r in rows}))}
     hour_idx = {h: i for i, h in enumerate(hours)}
 
-    # cell = [(5 токен-компонентов), (5 денежных компонентов)] — единый источник
+    # cell = [(5 токен-компонентов), (5 денежных компонентов), число Row] — единый источник
     # порядка компонентов с Rates.cost_components/components_of (in, out, cc5m,
     # cc1h, cr), без отдельного магического смещения по индексам.
     cells: dict[tuple, list] = {}
@@ -140,25 +190,29 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
         tok_comp, cost_comp = components_of(r)
         cell = cells.get(key)
         if cell is None:
-            cells[key] = [list(tok_comp), list(cost_comp)]
+            cells[key] = [list(tok_comp), list(cost_comp), 1]
         else:
-            tc, cc = cell
+            tc, cc, _ = cell
             for i in range(5):
                 tc[i] += tok_comp[i]
                 cc[i] += cost_comp[i]
+            cell[2] += 1
 
     # Параллельные плоские массивы вместо списка кортежей на запись — компактнее
     # в JSON и тривиально разбираются в JS.
-    h_a, s_a, t_a, m_a, a_a, p_a = [], [], [], [], [], []
+    h_a, s_a, t_a, m_a, pv_a, a_a, p_a = [], [], [], [], [], [], []
+    record_counts = []
     tok_arrs = {k: [] for k in COMPONENT_KEYS}
     cost_arrs = {k: [] for k in COMPONENT_KEYS}
-    for (h, s, t, m, a, p), (tok_comp, cost_comp) in cells.items():
+    for (h, s, t, m, pv, a, p), (tok_comp, cost_comp, count) in cells.items():
         h_a.append(h)
         s_a.append(s)
         t_a.append(t)
         m_a.append(m)
+        pv_a.append(pv)
         a_a.append(a)
         p_a.append(p)
+        record_counts.append(count)
         for k, tok_v, cost_v in zip(COMPONENT_KEYS, tok_comp, cost_comp):
             tok_arrs[k].append(tok_v)
             cost_arrs[k].append(round(cost_v, 6))
@@ -166,14 +220,17 @@ def build_raw(rows: list[Row], hours: list[str], components_of) -> dict:
     return {
         "tools": tools,
         "models": models,
+        "providers": providers,
         "agents": agents,
         "projects": projects,
         "hourIdx": h_a,
         "sessionIdx": s_a,
         "toolIdx": t_a,
         "modelIdx": m_a,
+        "providerIdx": pv_a,
         "agentIdx": a_a,
         "projectIdx": p_a,
+        "recordCounts": record_counts,
         **tok_arrs,
         **{cost_key(k): v for k, v in cost_arrs.items()},
     }
@@ -234,6 +291,7 @@ def build_payload(rows: list[Row], rates: dict) -> dict:
         # (--tool и период могут оставить один), поэтому список строится по данным.
         "sources": [TOOL_TITLES.get(t, t) for t in TOOLS if t in tools_present],
         "dimLabels": {dim: label for dim, (label, _) in DIMENSIONS.items()},
+        "providerLabels": provider_labels(rows),
         "palette": PALETTE,
         "otherColor": OTHER_COLOR,
         # Ставки по компонентам для показа в таблице (Rates.as_dict — те же поля).
@@ -290,17 +348,38 @@ TEMPLATE = """<!doctype html>
   .tile-label { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
   .tile-value { font-size: 26px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
   .tile-note { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 18px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 10px 12px;
+    align-items: center; margin-bottom: 18px;
+  }
+  .control-group {
+    display: flex; align-items: center; gap: 6px;
+    flex: 0 0 auto; white-space: nowrap;
+  }
+  .control-label { color: var(--muted); font-size: 12px; flex: none; }
+  .control-buttons { display: flex; align-items: center; gap: 6px; }
+  .controls button { padding-inline: 8px; }
   button {
     font: inherit; font-size: 13px; padding: 6px 13px; cursor: pointer;
     background: var(--surface); color: var(--ink-2);
     border: 1px solid var(--axis); border-radius: 999px;
   }
   button[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+  @media (max-width: 900px) {
+    .control-group--dimension {
+      flex: 1 1 100%; min-width: 0; align-items: flex-start; white-space: normal;
+    }
+    .control-group--dimension .control-buttons { flex-wrap: wrap; }
+  }
+  @media (max-width: 600px) {
+    .control-group { flex-basis: 100%; white-space: normal; }
+    .control-buttons { flex-wrap: wrap; }
+  }
   .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 16px; padding: 0; list-style: none; }
   .legend li { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
   .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
   .chart-wrap { overflow-x: auto; }
+  #chart { margin-inline: auto; }
   svg { display: block; }
   .tick { fill: var(--muted); font-size: 11px; }
   .gridline { stroke: var(--grid); stroke-width: 1; }
@@ -345,6 +424,13 @@ TEMPLATE = """<!doctype html>
   .filters-title { font-weight: 600; font-size: 14px; }
   .filters-count { color: var(--muted); font-size: 12px; flex: 1; }
   #filtersReset { margin-left: auto; }
+  .filter-period { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 14px; }
+  .filter-period > span { font-weight: 500; font-size: 13px; }
+  .filter-period label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .filter-period input {
+    font: inherit; font-size: 12px; padding: 5px 8px;
+    background: var(--plane); color: var(--ink); border: 1px solid var(--grid); border-radius: 6px;
+  }
   .filter-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
   .filter-group { border: 1px solid var(--grid); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; min-width: 0; }
   .filter-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -381,6 +467,11 @@ TEMPLATE = """<!doctype html>
     <span class="filters-title">Фильтры</span>
     <span class="filters-count" id="filterCount"></span>
     <button id="filtersReset">Сбросить все</button>
+  </div>
+  <div class="filter-period">
+    <span>Период</span>
+    <label>с <input type="date" id="dateFrom"></label>
+    <label>по <input type="date" id="dateTo"></label>
   </div>
   <div class="filter-groups" id="filterGroups"></div>
 </div>
@@ -462,8 +553,8 @@ function pickBucketSize(hoursLen) {
 // длине периода (pickBucketSize). Ключ кнопки ('hour'/'day'/'week') переводится
 // в размер бакета здесь — единственное место конвертации из строки в число.
 const BUCKET_SIZE = { hour: HOUR, day: DAY, week: WEEK };
-function resolveBucketSize() {
-  return bucketSizeMode === 'auto' ? pickBucketSize(DATA.hours.length) : BUCKET_SIZE[bucketSizeMode];
+function resolveBucketSize(hoursLen) {
+  return bucketSizeMode === 'auto' ? pickBucketSize(hoursLen) : BUCKET_SIZE[bucketSizeMode];
 }
 
 // Смещение первого бакета, чтобы границы DAY/WEEK совпадали с календарными
@@ -563,24 +654,37 @@ function bucketIndex(hi, bucketSize, offset) {
 // один раз на бакет, если у неё есть ненулевая активность в любом часу бакета.
 // Это и есть знаменатель «на сессию» для дневных/недельных столбиков и линии
 // среднего. Правило активности то же, что в computeMetrics (t > 0).
-function sessionsPerBucket(bucketSize, offset) {
-  const r = DATA.raw, H = DATA.hours.length;
+function sessionsPerBucket(bucketSize, offset, ctx) {
+  const r = DATA.raw, H = ctx.hours.length;
   const n = bucketCount(bucketSize, offset, H);
   const sets = Array.from({ length: n }, () => new Set());
   const comps = activeComps();
-  for (const i of filteredIndexes()) {
+  for (const i of filteredIndexes(ctx)) {
     if (cellTok(i, comps) <= 0) continue;
-    sets[bucketIndex(r.hourIdx[i], bucketSize, offset)].add(r.sessionIdx[i]);
+    sets[bucketIndex(r.hourIdx[i] - ctx.start, bucketSize, offset)].add(r.sessionIdx[i]);
   }
   return sets.map(s => s.size);
 }
 
-let dim = 'tool';                        // tool | model | agent | project | components
+let dim = 'tool';                        // tool | model | provider | agent | project | components
 let unit = 'cost';                       // cost | tokens
 let bucketSizeMode = 'auto';             // 'auto' | 'hour' | 'day' | 'week' — ключ кнопки грануляции, как dim/unit
 let avgMode = 'hour';                    // 'hour' | 'session' — знаменатель линии среднего на графике
-const FILTER_DIMS = ['tool', 'model', 'agent', 'project'];
-const filters = { tool: new Set(), model: new Set(), agent: new Set(), project: new Set(), components: new Set() };
+let dateFrom = DATA.dateFrom, dateTo = DATA.dateTo;
+const FILTER_DIMS = ['tool', 'model', 'provider', 'agent', 'project'];
+const filters = {
+  tool: new Set(), model: new Set(), provider: new Set(), agent: new Set(),
+  project: new Set(), components: new Set(),
+};
+
+// Активный диапазон — полуинтервал абсолютных индексов [start, end) и его
+// локальная почасовая сетка. Сравнение строк корректно для ISO YYYY-MM-DD.
+function rangeContext() {
+  let start = 0, end = DATA.hours.length;
+  while (start < end && DATA.hours[start].slice(0, 10) < dateFrom) start++;
+  while (end > start && DATA.hours[end - 1].slice(0, 10) > dateTo) end--;
+  return { start, end, hours: DATA.hours.slice(start, end) };
+}
 
 // «Компоненты» — отдельное измерение (серии = 5 компонентов расхода), а не
 // переключатель стека: выбор «Компоненты» заменяет Инструмент/Модель/Агент/Проект.
@@ -608,6 +712,7 @@ const compColorAt = i => {
 // Цвет серии: для измерения «Компоненты» — палитра компонентов, иначе — серийная.
 const seriesColorAt = i => dim === 'components' ? compColorAt(i) : colorAt(i);
 const dimLabel = d => DATA.dimLabels[d] || COMP_DIM_LABEL;
+const valueLabel = (d, value) => d === 'provider' ? (DATA.providerLabels[value] || value) : value;
 
 const isCost = () => unit === 'cost';
 // Компактная форма для осей и плиток, точная — для таблицы и тултипа
@@ -619,9 +724,9 @@ const money2 = v => '$' + v.toFixed(2).replace('.', ',');
 const exact = v => isCost() ? money2(v) : fmtInt(Math.round(v));
 
 // Индексы агрегированных ячеек DATA.raw, прошедшие фильтр: AND между
-// измерениями (tool И model И agent И project), OR внутри одного измерения
+// измерениями (tool И model И provider И agent И project), OR внутри одного измерения
 // (любой отмеченный чекбокс подходит); пустой набор чекбоксов = не ограничивает.
-function filteredIndexes() {
+function filteredIndexes(ctx) {
   const r = DATA.raw, n = r.hourIdx.length, out = [];
   const active = FILTER_DIMS.filter(k => filters[k].size > 0);
   // Фильтр по компонентам НЕ отбирает ячейки — у каждой ячейки всегда все 5
@@ -630,6 +735,7 @@ function filteredIndexes() {
   // слагаемых при суммировании (см. activeComps/cellCost/cellTok), а не фильтр строк.
   outer:
   for (let i = 0; i < n; i++) {
+    if (r.hourIdx[i] < ctx.start || r.hourIdx[i] >= ctx.end) continue;
     for (const k of active) {
       if (!filters[k].has(r[k + 's'][r[k + 'Idx'][i]])) continue outer;
     }
@@ -659,9 +765,9 @@ const cellTok = (i, comps) => comps === ALL_COMPS
 // Группировка отфильтрованных ячеек по ОДНОМУ измерению (dim) — топ-8 серий
 // по стоимости + «Прочее», та же форма, что раньше строил Python build_dimension.
 // Для dim === 'components' серии — это 5 компонентов расхода (без «Прочее»).
-function aggregateByDim(idxs, groupDim) {
+function aggregateByDim(idxs, groupDim, ctx) {
   const r = DATA.raw;
-  const H = DATA.hours.length;
+  const H = ctx.hours.length;
   const comps = activeComps();
 
   if (groupDim === 'components') {
@@ -669,7 +775,7 @@ function aggregateByDim(idxs, groupDim) {
     const gridTok = Array.from({ length: H }, () => new Array(5).fill(0));
     const totals = { cost: new Array(5).fill(0), tokens: new Array(5).fill(0) };
     for (const i of idxs) {
-      const hi = r.hourIdx[i];
+      const hi = r.hourIdx[i] - ctx.start;
       for (const k of comps) {
         gridCost[hi][k] += r[COMP_COST_KEYS[k]][i];
         gridTok[hi][k] += r[COMP_KEYS[k]][i];
@@ -719,7 +825,7 @@ function aggregateByDim(idxs, groupDim) {
     const name = names[idxArr[i]];
     const si = index.has(name) ? index.get(name) : otherI;
     if (si == null) return;
-    const hi = r.hourIdx[i];
+    const hi = r.hourIdx[i] - ctx.start;
     const c = costs[j], t = toks[j];
     gridCost[hi][si] += c;
     gridTok[hi][si] += t;
@@ -747,8 +853,8 @@ function aggregateByDim(idxs, groupDim) {
 
 // Замена Python metrics/byHour/activeHours/calendarHours — считается из
 // отфильтрованных ячеек, чтобы тайлы пересчитывались вместе с фильтром.
-function computeMetrics(idxs) {
-  const r = DATA.raw, H = DATA.hours.length;
+function computeMetrics(idxs, ctx) {
+  const r = DATA.raw, H = ctx.hours.length;
   const comps = activeComps();
   const costHour = new Array(H).fill(0), tokHour = new Array(H).fill(0);
   // Уникальные сессии в каждом часу — та же «активность», что и tokHour (comps):
@@ -759,7 +865,7 @@ function computeMetrics(idxs) {
   const sessInHour = Array.from({ length: H }, () => new Set());
   const allSessions = new Set();
   for (const i of idxs) {
-    const hi = r.hourIdx[i];
+    const hi = r.hourIdx[i] - ctx.start;
     const t = cellTok(i, comps);
     costHour[hi] += cellCost(i, comps);
     tokHour[hi] += t;
@@ -788,12 +894,13 @@ function computeMetrics(idxs) {
       // avgSession = средний расход одной УНИКАЛЬНОЙ сессии за весь период.
       avgPerSessionHour: totalSessionHours ? grand / totalSessionHours : 0,
       avgSession: totalSessions ? grand / totalSessions : 0,
-      peak, peakHour: series.length && peak > 0 ? DATA.hours[series.indexOf(peak)] : '',
+      peak, peakHour: series.length && peak > 0 ? ctx.hours[series.indexOf(peak)] : '',
     };
   }
   return { byHour, metrics, activeHours: activeIdx.length, calendarHours: H,
     totalSessions, totalSessionHours,
-    sessionsPerHour: sessInHour.map(s => s.size), records: idxs.length };
+    sessionsPerHour: sessInHour.map(s => s.size),
+    records: idxs.reduce((s, i) => s + r.recordCounts[i], 0) };
 }
 
 function tiles(m) {
@@ -813,7 +920,7 @@ function tiles(m) {
      session ? m.totalSessions + ' сессий за период' : 'с учётом простоев'],
     ['Пик за час', compact(mu.peak), mu.peakHour ? hourLabel(mu.peakHour) : ''],
     [isCost() ? 'Всего' : 'Всего токенов', compact(mu.grand),
-     fmtInt(DATA.rawRecords) + ' записей за период'],
+     fmtInt(m.records) + ' записей за период'],
   ];
   document.getElementById('tiles').innerHTML = items.map(([l, v, n]) =>
     `<div><div class="tile-label">${l}</div><div class="tile-value">${v}</div>` +
@@ -824,9 +931,9 @@ function tiles(m) {
   // зависят от того, что сейчас отмечено чекбоксами.
   const parts = [];
   if (DATA.subscription.length)
-    parts.push('По подписке (стоимость $0): ' + DATA.subscription.join(', ') + '.');
+    parts.push('За весь отчёт по подписке (стоимость $0): ' + DATA.subscription.join(', ') + '.');
   if (DATA.unpriced.tokens)
-    parts.push('Без прайсинга: ' + compactTok(DATA.unpriced.tokens) +
+    parts.push('За весь отчёт без прайсинга: ' + compactTok(DATA.unpriced.tokens) +
       ' токенов (' + DATA.unpriced.models.join(', ') + ') — в сумму денег не входят.');
   if (DATA.hasCodex)
     parts.push('Codex посчитан по обычному тарифу: признака fast-режима в логах нет, ' +
@@ -839,22 +946,29 @@ function tiles(m) {
 
 function controls() {
   document.getElementById('controls').innerHTML =
-    '<span style="color:var(--muted);font-size:12px">Разбивка:</span>' +
+    '<div class="control-group control-group--dimension">' +
+    '<span class="control-label">Разбивка:</span><span class="control-buttons">' +
     Object.entries(DATA.dimLabels).map(([k, label]) =>
       `<button data-dim="${k}" aria-pressed="${k === dim}">${label}</button>`).join('') +
     `<button data-dim="components" aria-pressed="${dim === 'components'}">${COMP_DIM_LABEL}</button>` +
-    '<span style="color:var(--muted);font-size:12px">Грануляция:</span>' +
+    '</span></div>' +
+    '<div class="control-group control-group--bucket">' +
+    '<span class="control-label">Грануляция:</span><span class="control-buttons">' +
     `<button data-bucket="auto" aria-pressed="${bucketSizeMode === 'auto'}">Авто</button>` +
     `<button data-bucket="hour" aria-pressed="${bucketSizeMode === 'hour'}">Час</button>` +
     `<button data-bucket="day" aria-pressed="${bucketSizeMode === 'day'}">День</button>` +
     `<button data-bucket="week" aria-pressed="${bucketSizeMode === 'week'}">Неделя</button>` +
-    '<span style="flex:1"></span>' +
-    '<span style="color:var(--muted);font-size:12px">Единицы:</span>' +
+    '</span></div>' +
+    '<div class="control-group control-group--unit">' +
+    '<span class="control-label">Единицы:</span><span class="control-buttons">' +
     `<button data-unit="cost" aria-pressed="${unit === 'cost'}">$</button>` +
     `<button data-unit="tokens" aria-pressed="${unit === 'tokens'}">токены</button>` +
-    '<span style="color:var(--muted);font-size:12px">Среднее:</span>' +
+    '</span></div>' +
+    '<div class="control-group control-group--average">' +
+    '<span class="control-label">Среднее:</span><span class="control-buttons">' +
     `<button data-avg="hour" aria-pressed="${avgMode === 'hour'}">активный час</button>` +
-    `<button data-avg="session" aria-pressed="${avgMode === 'session'}">сессия</button>`;
+    `<button data-avg="session" aria-pressed="${avgMode === 'session'}">сессия</button>` +
+    '</span></div>';
   document.querySelectorAll('#controls button[data-dim]').forEach(b =>
     b.onclick = () => { dim = b.dataset.dim; render(); });
   document.querySelectorAll('#controls button[data-unit]').forEach(b =>
@@ -872,7 +986,7 @@ function controls() {
       });
   };
   bindToggle('#controls button[data-bucket]', 'bucket', v => bucketSizeMode = v,
-    () => { if (curD && curM) chart(curD, curM); });
+    () => { if (curD && curM && curCtx) chart(curD, curM, curCtx); });
   bindToggle('#controls button[data-avg]', 'avg', v => avgMode = v, render);
 }
 
@@ -897,9 +1011,11 @@ function renderFilterGroups() {
   const compGroup = renderFilterGroup('components', COMP_DIM_LABEL, COMP_KEYS, COMP_LABELS);
 
   document.getElementById('filterGroups').innerHTML =
-    FILTER_DIMS.map(k =>
-      renderFilterGroup(k, DATA.dimLabels[k], DATA.raw[k + 's'], DATA.raw[k + 's'])
-    ).join('') + compGroup;
+    FILTER_DIMS.map(k => {
+      const opts = DATA.raw[k + 's'];
+      const labels = opts.map(v => valueLabel(k, v));
+      return renderFilterGroup(k, DATA.dimLabels[k], opts, labels);
+    }).join('') + compGroup;
 
   const groups = document.getElementById('filterGroups');
   groups.addEventListener('change', e => {
@@ -932,16 +1048,46 @@ function renderFilterGroups() {
   document.getElementById('filtersReset').onclick = () => {
     FILTER_DIMS.forEach(k => filters[k].clear());
     filters.components.clear();
+    dateFrom = DATA.dateFrom;
+    dateTo = DATA.dateTo;
+    syncDateInputs();
     groups.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
     render();
   };
 }
 
+function syncDateInputs() {
+  const from = document.getElementById('dateFrom'), to = document.getElementById('dateTo');
+  from.min = DATA.dateFrom; from.max = dateTo; from.value = dateFrom;
+  to.min = dateFrom; to.max = DATA.dateTo; to.value = dateTo;
+}
+
+function setupDateFilter() {
+  const from = document.getElementById('dateFrom'), to = document.getElementById('dateTo');
+  syncDateInputs();
+  const changed = e => {
+    let nextFrom = from.value || DATA.dateFrom;
+    let nextTo = to.value || DATA.dateTo;
+    nextFrom = nextFrom < DATA.dateFrom ? DATA.dateFrom : nextFrom > DATA.dateTo ? DATA.dateTo : nextFrom;
+    nextTo = nextTo < DATA.dateFrom ? DATA.dateFrom : nextTo > DATA.dateTo ? DATA.dateTo : nextTo;
+    if (nextFrom > nextTo) {
+      if (e.target === from) nextTo = nextFrom; else nextFrom = nextTo;
+    }
+    dateFrom = nextFrom; dateTo = nextTo;
+    syncDateInputs();
+    render();
+  };
+  from.addEventListener('change', changed);
+  to.addEventListener('change', changed);
+}
+
 function updateFilterCount(idxs) {
   const rowsActive = FILTER_DIMS.some(k => filters[k].size > 0);
   const compsActive = filters.components.size > 0;
+  const datesActive = dateFrom !== DATA.dateFrom || dateTo !== DATA.dateTo;
   const parts = [];
-  if (rowsActive)
+  if (datesActive) parts.push(`период ${dateFrom} — ${dateTo}`);
+  if (rowsActive || datesActive)
     parts.push(`показано ${fmtInt(idxs.length)} из ${fmtInt(DATA.raw.cost.length)} агрегированных строк`);
   // Фильтр компонентов не отбирает строки — он сужает, какие слагаемые (Вход/Выход/…)
   // входят в сумму, поэтому подпись формулируется отдельно, чтобы не читаться как «строк меньше».
@@ -956,7 +1102,7 @@ function legend(d) {
   const shown = d.names.filter((n, i) => tot[i] > 0);
   document.getElementById('legend').innerHTML = shown.length < 2 ? '' :
     d.names.map((n, i) => tot[i] > 0
-      ? `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</li>` : '').join('');
+      ? `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(valueLabel(dim, n))}</li>` : '').join('');
 }
 
 // Значение линии среднего: HOUR — готовый метрик из m.metrics[unit]; DAY/WEEK —
@@ -980,10 +1126,11 @@ function avgLineY(bucketSize, m, series, hours, offset, mode, sessPerBucket) {
   return average(per);
 }
 
-function chart(d, m) {
-  const bucketSize = resolveBucketSize();
-  const offset = bucketOffset(DATA.hours, bucketSize);
-  const b = bucketize(DATA.hours, d.grid[unit], m.byHour[unit], bucketSize, offset);
+function chart(d, m, ctx) {
+  const allHours = ctx.hours;
+  const bucketSize = resolveBucketSize(allHours.length);
+  const offset = bucketOffset(allHours, bucketSize);
+  const b = bucketize(allHours, d.grid[unit], m.byHour[unit], bucketSize, offset);
   // hours ниже — забакеченный массив (длина = число бакетов), для итерации баров/тиков.
   // DATA.hours — исходный почасовой; их не путать, bucketLabel ниже намеренно берёт
   // именно DATA.hours (см. её комментарий).
@@ -993,7 +1140,7 @@ function chart(d, m) {
   // сумма, полный grid не нужен, поэтому bucketizeSeries вместо bucketize (не тратим
   // O(hours*S) на agregацию неиспользуемой разбивки по сериям).
   const altUnit = isCost() ? 'tokens' : 'cost';
-  const altSeries = bucketizeSeries(DATA.hours, m.byHour[altUnit], bucketSize, offset);
+  const altSeries = bucketizeSeries(allHours, m.byHour[altUnit], bucketSize, offset);
   // В режиме «сессия» столбики показывают расход на сессию в бакете, а не сумму
   // бакета: иначе переключатель менял бы только линию среднего, и график «не
   // перестраивался» бы с точки зрения пользователя. Нормируем series/grid/altSeries
@@ -1002,7 +1149,7 @@ function chart(d, m) {
   // после неё, а здесь храним оба варианта. sessPerBucket считается ОДИН раз и
   // передаётся в avgLineY — иначе каждый вызов делал бы полный проход по raw.
   const sessPerBucket = avgMode === 'session'
-    ? (bucketSize === HOUR ? m.sessionsPerHour : sessionsPerBucket(bucketSize, offset)) : null;
+    ? (bucketSize === HOUR ? m.sessionsPerHour : sessionsPerBucket(bucketSize, offset, ctx)) : null;
   const dispSeries = sessPerBucket
     ? series.map((v, bi) => sessPerBucket[bi] > 0 ? v / sessPerBucket[bi] : 0) : series;
   const dispGrid = sessPerBucket
@@ -1010,7 +1157,16 @@ function chart(d, m) {
     : grid;
   const dispAlt = sessPerBucket
     ? altSeries.map((v, bi) => sessPerBucket[bi] > 0 ? v / sessPerBucket[bi] : 0) : altSeries;
-  curBucket = { hours, grid: dispGrid, series: dispSeries, altSeries: dispAlt, names: d.names, bucketSize, offset };
+  const avgY = avgLineY(bucketSize, m, series, allHours, offset, avgMode, sessPerBucket);
+  const avgLabel = avgMode === 'session'
+    ? `среднее на сессию за ${BUCKET_UNIT_LABEL[bucketSize]}`
+    : `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
+  const avgText = `${avgLabel} · ${compact(avgY)}`;
+  const tw = avgText.length * 5.9 + 10;
+  curBucket = {
+    hours, allHours, grid: dispGrid, series: dispSeries, altSeries: dispAlt,
+    names: d.names, bucketSize, offset,
+  };
   const L = 62, R = 44, T = 12, B = 46, H = 300;   // R с запасом под последнюю подпись оси
 
   // Ширина столбика — от реальной ширины контейнера, а не от фиксированных
@@ -1022,15 +1178,19 @@ function chart(d, m) {
   const wrapWidth = document.querySelector('.chart-wrap').clientWidth || 900;
   const avail = Math.max(wrapWidth - L - R, 100);
   const minBw = hours.length > 400 ? 2 : hours.length > 160 ? 3 : 4;
-  // Независимая переменная — шаг на бакет (bw + gap), а не bw и gap по отдельности:
-  // так gap выводится из шага одной формулой, без взаимозависимого подбора.
-  // bw кламплен потолком 20 — при большом step (мало бакетов, широкий контейнер)
-  // фактическая bw+gap может оказаться меньше step, и W (ниже, из факта bw/gap)
-  // тогда меньше avail — это ожидаемо, не переполнение.
-  const step = Math.max(minBw + 1, Math.floor(avail / hours.length));
+  // Для малого числа бакетов график остаётся компактным, но каждый бакет получает
+  // отдельный слот; SVG центрируется CSS-ом. Минимальная внутренняя ширина также
+  // учитывает подпись среднего, поэтому она не может выйти за viewBox.
+  const compactBuckets = hours.length <= 12;
+  const minInner = compactBuckets ? Math.max(hours.length * 78, tw + 4) : hours.length * (minBw + 1);
+  const innerW = compactBuckets ? minInner : Math.max(avail, minInner);
+  const step = innerW / Math.max(hours.length, 1);
   const gap = step - minBw > 6 ? 2 : 1;
-  const bw = Math.max(minBw, Math.min(20, step - gap));
-  const W = L + R + hours.length * (bw + gap);
+  const bw = compactBuckets
+    ? Math.max(minBw, Math.min(32, step - gap))
+    : Math.max(minBw, Math.min(20, Math.floor(step) - gap));
+  const barX = hi => L + hi * step + (step - bw) / 2;
+  const W = L + R + innerW;
   const max = Math.max(...dispSeries, isCost() ? 0.01 : 1);
 
   // округляем верх шкалы до «чистого» числа
@@ -1047,7 +1207,7 @@ function chart(d, m) {
 
   const sc = surface();
   hours.forEach((h, hi) => {
-    const x = L + hi * (bw + gap);
+    const x = barX(hi);
     let acc = 0;
     dispGrid[hi].forEach((v, si) => {
       if (v <= 0) return;
@@ -1071,7 +1231,7 @@ function chart(d, m) {
   if (bucketSize === HOUR) {
     hours.forEach((h, hi) => {
       if (hi > 0 && isMidnight(h)) {
-        const x = L + hi * (bw + gap);
+        const x = L + hi * step;
         s += `<line class="dayline" x1="${x}" y1="${T}" x2="${x}" y2="${T + H}"/>`;
       }
     });
@@ -1079,12 +1239,12 @@ function chart(d, m) {
 
   // подписи оси X — разрежённые, чтобы не наезжали друг на друга.
   // Последнюю пропускаем, если она не помещается целиком: обрезанный текст хуже отсутствующего.
-  const tickStep = Math.max(1, Math.ceil(hours.length / Math.floor((W - L - R) / 78)));
+  const tickStep = Math.max(1, Math.ceil(hours.length / Math.max(1, Math.floor(innerW / 78))));
   hours.forEach((h, hi) => {
     if (hi % tickStep) return;
-    const x = L + hi * (bw + gap) + bw / 2;
-    if (x + 36 > W) return;
-    s += `<text class="tick" x="${x}" y="${T + H + 18}" text-anchor="middle">${bucketLabel(bucketSize, DATA.hours, hi, offset)}</text>`;
+    const x = barX(hi) + bw / 2;
+    if (x + 36 > W - R) return;
+    s += `<text class="tick" x="${x}" y="${T + H + 18}" text-anchor="middle">${bucketLabel(bucketSize, allHours, hi, offset)}</text>`;
   });
 
   // Линия среднего идёт поверх столбиков, поэтому подпись ставим у правого края
@@ -1100,13 +1260,7 @@ function chart(d, m) {
   // DATA.hours, как и в altSeries выше; иначе bucketizeSeries считал бы границы
   // по длине бакетов и индексировал бы сырой массив неверно. sessPerBucket уже
   // посчитан выше (один проход) и передаётся готовым.
-  const avgY = avgLineY(bucketSize, m, series, DATA.hours, offset, avgMode, sessPerBucket);
-  const avgLabel = avgMode === 'session'
-    ? `среднее на сессию за ${BUCKET_UNIT_LABEL[bucketSize]}`
-    : `среднее за ${BUCKET_UNIT_LABEL[bucketSize]}`;
   const ya = y(avgY);
-  const avgText = `${avgLabel} · ${compact(avgY)}`;
-  const tw = avgText.length * 5.9 + 10;
   const tx = Math.max(W - R - tw, L + 2);
   s += `<line class="avgline" x1="${L}" x2="${W - R}" y1="${ya}" y2="${ya}"/>` +
        `<rect x="${tx}" y="${ya - 19}" width="${tw}" height="15" fill="${sc}" rx="3"/>` +
@@ -1127,7 +1281,7 @@ function pie(d) {
 
   document.getElementById('pieTitle').textContent = 'Расходы по измерению «' + dimLabel(dim) + '»';
   document.getElementById('pieSub').textContent =
-    `${DATA.dateFrom} – ${DATA.dateTo} · всего ${exact(total)}`;
+    `${dateFrom} – ${dateTo} · всего ${exact(total)}`;
   document.getElementById('pieTotal').textContent = compact(total);
 
   const polar = (r, deg) => {
@@ -1161,7 +1315,7 @@ function pie(d) {
     .sort((a, b) => b[1] - a[1])
     .map(([n, v, i]) =>
       `<li><span class="swatch" style="background:${seriesColorAt(i)}"></span>` +
-      `<span class="name">${escapeHtml(n)}</span>` +
+      `<span class="name">${escapeHtml(valueLabel(dim, n))}</span>` +
       `<span class="pct">${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</span></li>`)
     .join('');
 }
@@ -1227,7 +1381,7 @@ function table(d, m) {
     compHeaders + (showRates ? '<th>Ставка $/Mtok</th>' : '') +
     `</tr></thead><tbody>` +
     rows.map(([n, v, o, i]) =>
-      `<tr><td><span class="name-cell"><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(n)}</span></td>` +
+      `<tr><td><span class="name-cell"><span class="swatch" style="background:${seriesColorAt(i)}"></span>${escapeHtml(valueLabel(dim, n))}</span></td>` +
       `<td>${exact(v)}</td>` +
       `<td>${total ? (v / total * 100).toFixed(1).replace('.', ',') : '0,0'}%</td>` +
       `<td>${exact(v / denom)}</td><td>${fmtOther(o)}</td>` +
@@ -1242,7 +1396,7 @@ function table(d, m) {
     `</tr></tfoot>`;
 }
 
-let curD = null, curM = null, curBucket = null;
+let curD = null, curM = null, curCtx = null, curBucket = null;
 const tip = document.getElementById('tip');
 document.getElementById('chart').addEventListener('mousemove', e => {
   const t = e.target.closest('rect[data-h]');
@@ -1251,12 +1405,12 @@ document.getElementById('chart').addEventListener('mousemove', e => {
   const cells = b.grid[hi].map((v, i) => [b.names[i], v, i])
     .filter(r => r[1] > 0).sort((a, b) => b[1] - a[1]);
   const alt = b.altSeries[hi];
-  tip.innerHTML = `<b>${bucketLabel(b.bucketSize, DATA.hours, hi, b.offset)}</b>` +
+  tip.innerHTML = `<b>${bucketLabel(b.bucketSize, b.allHours, hi, b.offset)}</b>` +
     `<div class="row"><span>всего</span><span>${exact(b.series[hi])}</span></div>` +
     `<div class="row" style="opacity:.65"><span>${isCost() ? 'токенов' : 'стоимость'}</span>` +
     `<span>${isCost() ? compactTok(alt) : money2(alt)}</span></div>` +
     cells.map(([n, v, i]) =>
-      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${seriesColorAt(i)}"></span> ${escapeHtml(n)}</span>` +
+      `<div class="row"><span><span class="swatch" style="display:inline-block;background:${seriesColorAt(i)}"></span> ${escapeHtml(valueLabel(dim, n))}</span>` +
       `<span>${exact(v)}</span></div>`).join('');
   tip.style.opacity = 1;
   const r = tip.getBoundingClientRect();
@@ -1271,20 +1425,21 @@ function render() {
   document.querySelectorAll('#controls button[data-unit]').forEach(b =>
     b.setAttribute('aria-pressed', String(b.dataset.unit === unit)));
 
-  const idxs = filteredIndexes();
-  const d = aggregateByDim(idxs, dim);
-  const m = computeMetrics(idxs);
-  curD = d; curM = m;
+  const ctx = rangeContext();
+  const idxs = filteredIndexes(ctx);
+  const d = aggregateByDim(idxs, dim, ctx);
+  const m = computeMetrics(idxs, ctx);
+  curD = d; curM = m; curCtx = ctx;
 
-  tiles(m); legend(d); chart(d, m); pie(d); table(d, m);
+  tiles(m); legend(d); chart(d, m, ctx); pie(d); table(d, m);
   updateFilterCount(idxs);
+  document.getElementById('subtitle').textContent =
+    `${dateFrom} — ${dateTo} · локальное время · источники: ${DATA.sources.join(', ')}`;
   document.getElementById('foot').textContent = d.otherCount
     ? `«Прочее» объединяет ещё ${d.otherCount} значений измерения «${dimLabel(dim)}».` : '';
 }
 
-document.getElementById('subtitle').textContent =
-  `${DATA.dateFrom} — ${DATA.dateTo} · локальное время · источники: ${DATA.sources.join(', ')}`;
-controls(); renderFilterGroups(); render();
+controls(); renderFilterGroups(); setupDateFilter(); render();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
 
 // Ширина столбиков графика зависит от ширины контейнера — при ресайзе окна
@@ -1292,7 +1447,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
 let resizeTimer;
 addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { if (curD && curM) chart(curD, curM); }, 120);
+  resizeTimer = setTimeout(() => { if (curD && curM && curCtx) chart(curD, curM, curCtx); }, 120);
 });
 </script>
 </body>
