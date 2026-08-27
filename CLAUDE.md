@@ -49,7 +49,7 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
 - **`parse.py`** — параллельный парсер (`ProcessPoolExecutor`, до 8 воркеров)
   логов `~/.claude/projects/**/*.jsonl` и `~/.codex/sessions/**/rollout-*.jsonl`.
   Каждая запись превращается в `Row` (`NamedTuple`): час, инструмент, модель,
-  агент, проект, 4 типа токенов. `collect()` — главная точка входа как
+  провайдер, агент, проект, 4 типа токенов. `collect()` — главная точка входа как
   библиотека, возвращает `list[Row]`.
 
   ZCode стоит особняком: его расход лежит не в jsonl, а в SQLite
@@ -76,7 +76,7 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
      в отдельную строку «без прайсинга», а не смешивается с `$0`.
 
 - **`report.py`** — строит JSON-payload (`build_payload`, `build_dimension`)
-  по четырём измерениям (`DIMENSIONS`: tool/model/agent/project) и вшивает его
+  по пяти измерениям (`DIMENSIONS`: tool/model/provider/agent/project) и вшивает его
   в `TEMPLATE` (строковый HTML/JS с Chart.js через CDN — единственная внешняя
   зависимость, и та браузерная, не Python). Серии ограничены `MAX_SERIES` (=
   длина `PALETTE`), остальное схлопывается в «Прочее». **Порядок цветов в
@@ -88,6 +88,10 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
   CLI: main/sidechain/сабагенты). Ключи технические, они приходят из `Row`, и
   переименовывать их под подписи не нужно. Подписи живут только в `DIMENSIONS`
   и растекаются по UI через `dimLabels` — в `TEMPLATE` их хардкода нет.
+  `provider` хранит технический id: Codex берёт его из `session_meta`, ZCode —
+  из `model_usage.provider_id`, Claude пишет `unknown`, потому что usage-log не
+  фиксирует backend. Подписи провайдеров читаются только из полей `name`
+  конфигураций; секреты и URL в payload не попадают.
 
 - **`verify.py`** — гоняет `ccusage` подпроцессом (`run_ccusage`) и сравнивает
   с результатом `parse.collect()` + `pricing.load()` по каждому компоненту

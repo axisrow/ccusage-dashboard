@@ -71,6 +71,7 @@ class Row(NamedTuple):
     date: str  # "YYYY-MM-DD" в локальной TZ
     tool: str  # claude | codex | zcode
     model: str
+    provider: str  # точный id провайдера из лога либо "unknown"
     agent: str  # main / имя подагента
     project: str  # абсолютный cwd либо "unknown"
     session: str  # каталог сессии (идентичность уникальна в рамках инструмента)
@@ -192,6 +193,8 @@ def parse_claude(path: str) -> list[Row]:
                 date=date,
                 tool="claude",
                 model=msg.get("model") or "unknown",
+                # Claude Code не пишет фактический backend/provider в usage-log.
+                provider="unknown",
                 agent=agent,
                 project=rec.get("cwd") or "unknown",
                 session=session,
@@ -256,6 +259,7 @@ def parse_codex(path: str) -> list[Row]:
     source: object = None
     originator: str | None = None
     model: str | None = None
+    provider = "unknown"
 
     try:
         fh = open(path, errors="ignore")
@@ -276,6 +280,7 @@ def parse_codex(path: str) -> list[Row]:
                     cwd = p.get("cwd") or "unknown"
                     source = p.get("source")
                     originator = p.get("originator")
+                    provider = p.get("model_provider") or "unknown"
                 continue
 
             # ловушка 5: модель только здесь, в session_meta её нет
@@ -332,6 +337,7 @@ def parse_codex(path: str) -> list[Row]:
                     date=date,
                     tool="codex",
                     model=model or "unknown",
+                    provider=provider,
                     agent=_codex_agent(source, originator),
                     project=cwd,
                     session=session,
@@ -352,7 +358,7 @@ def parse_codex(path: str) -> list[Row]:
 # status: строки running/error/cancelled — это незавершённые или неоплаченные
 # запросы, ccusage их тоже отбрасывает.
 ZCODE_SQL = """
-SELECT mu.model_id, mu.started_at, mu.agent, mu.session_id,
+SELECT mu.model_id, mu.provider_id, mu.started_at, mu.agent, mu.session_id,
        mu.input_tokens, mu.output_tokens,
        mu.cache_creation_input_tokens, mu.cache_read_input_tokens,
        s.directory
@@ -389,7 +395,11 @@ def parse_zcode(db_path: str) -> list[Row]:
 
     rows: list[Row] = []
     try:
-        for model, started, agent, session, inp, out, cc, cr, directory in con.execute(ZCODE_SQL):
+        # Старые базы ZCode могли не иметь provider_id. Не теряем весь источник:
+        # такие строки остаются фильтруемыми как «Не указан в логе».
+        columns = {row[1] for row in con.execute("PRAGMA table_info(model_usage)")}
+        sql = ZCODE_SQL if "provider_id" in columns else ZCODE_SQL.replace("mu.provider_id", "'unknown'")
+        for model, provider, started, agent, session, inp, out, cc, cr, directory in con.execute(sql):
             if not started:
                 continue
             inp, out = inp or 0, out or 0
@@ -407,6 +417,7 @@ def parse_zcode(db_path: str) -> list[Row]:
                     date=date,
                     tool="zcode",
                     model=(model or "unknown").strip(),
+                    provider=(provider or "unknown").strip(),
                     agent=agent or "main",
                     project=directory or "unknown",
                     session=session or "unknown",
