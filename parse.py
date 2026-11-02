@@ -22,9 +22,10 @@ parse.py — быстрый сбор расхода токенов из лока
   7. ZCode хранит расход не в jsonl, а в SQLite ~/.zcode/cli/db/db.sqlite, и его
      input_tokens ВКЛЮЧАЕТ обе части кэша — свежий input добывается вычитанием.
      started_at там в миллисекундах, а reasoning_tokens уже входит в output.
-  8. Codex архивирует старые сессии в ~/.codex/archived_sessions/*.jsonl.zst —
-     в sessions/ остаются только пара недель; без архива теряются целые месяцы
-     (август 2026 — 162 сессии).
+  8. Codex сжимает старые rollout-логи zstd ДВУМЯ путями: на месте внутри
+     sessions/ и переносом в ~/.codex/archived_sessions/. Обычных .jsonl
+     остаются единицы: без обоих zst-глобов теряются месяцы (октябрь 2026 —
+     148 из 166 сессий лежали сжатыми в sessions/).
 
 Только stdlib, Python 3.9+.
 """
@@ -49,7 +50,9 @@ from typing import Iterable, NamedTuple
 HOME = Path.home()
 CLAUDE_GLOB = str(HOME / ".claude/projects/**/*.jsonl")
 CODEX_GLOB = str(HOME / ".codex/sessions/**/rollout-*.jsonl")
-# Архив Codex (ловушка 8): без него парсер теряет целые месяцы.
+# Сжатые на месте rollout'ы (ловушка 8): их в 50 раз больше, чем обычных.
+CODEX_ZST_GLOB = str(HOME / ".codex/sessions/**/rollout-*.jsonl.zst")
+# Плюс плоский архив Codex: без обоих zst-глобов теряются целые месяцы.
 CODEX_ARCHIVE_GLOB = str(HOME / ".codex/archived_sessions/rollout-*.jsonl.zst")
 # ZCode — единственный источник-БД, а не набор файлов (ловушка 7). ZCODE_HOME
 # задаёт home-каталоги через запятую (так же, как в ccusage), путь к самой базе
@@ -307,6 +310,8 @@ def parse_codex(path: str) -> list[Row]:
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 if rec.get("type") == "session_meta":
                     p = rec.get("payload") or {}
                     cwd = p.get("cwd") or "unknown"
@@ -321,6 +326,8 @@ def parse_codex(path: str) -> list[Row]:
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 if rec.get("type") == "turn_context":
                     model = (rec.get("payload") or {}).get("model")
                 continue
@@ -330,6 +337,8 @@ def parse_codex(path: str) -> list[Row]:
             try:
                 rec = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(rec, dict):
                 continue
 
             payload = rec.get("payload") or {}
@@ -494,6 +503,7 @@ def collect(
         jobs.append((parse_claude, glob.glob(CLAUDE_GLOB, recursive=True)))
     if "codex" in tools:
         files = glob.glob(CODEX_GLOB, recursive=True)
+        files += glob.glob(CODEX_ZST_GLOB, recursive=True)
         archived = glob.glob(CODEX_ARCHIVE_GLOB)
         if archived:
             if shutil.which("zstd"):

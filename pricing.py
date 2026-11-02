@@ -399,8 +399,15 @@ def build(
 
 
 def save(table: dict[str, Rates]) -> None:
+    # sort_keys: без него setdefault-merge перемешивает порядок, и diff каждого
+    # refresh наполовину состоит из перестановок неизменившихся блоков
     CACHE.write_text(
-        json.dumps({m: r.as_dict() for m, r in table.items()}, indent=1, ensure_ascii=False),
+        json.dumps(
+            {m: r.as_dict() for m, r in table.items()},
+            indent=1,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
@@ -435,9 +442,10 @@ def load() -> RateTable:
         return RateTable()
     try:
         raw = json.loads(CACHE.read_text(encoding="utf-8"))
-    except ValueError:
+        return RateTable((m, Rates.from_dict(d)) for m, d in raw.items())
+    except (ValueError, KeyError, TypeError):
+        # кэш битой формы не должен ронять refresh/report — он же его пересоберёт
         return RateTable()
-    return RateTable((m, Rates.from_dict(d)) for m, d in raw.items())
 
 
 def describe(table: dict[str, Rates]) -> None:

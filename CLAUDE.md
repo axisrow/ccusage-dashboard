@@ -47,10 +47,11 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
 с `ccusage`.
 
 - **`parse.py`** — параллельный парсер (`ProcessPoolExecutor`, до 8 воркеров)
-  логов `~/.claude/projects/**/*.jsonl` и `~/.codex/sessions/**/rollout-*.jsonl`,
-  плюс архив Codex `~/.codex/archived_sessions/*.jsonl.zst` — Codex держит в
-  `sessions/` только пару недель (ловушка 15). Архив распаковывается утилитой
-  `zstd` из PATH; нет её — архив пропускается с предупреждением в stderr.
+  логов `~/.claude/projects/**/*.jsonl` и Codex-сессий в трёх глобах:
+  живые `~/.codex/sessions/**/rollout-*.jsonl`, сжатые на месте
+  `~/.codex/sessions/**/rollout-*.jsonl.zst` (их в разы больше — ловушка 15)
+  и архив `~/.codex/archived_sessions/rollout-*.jsonl.zst`. Zst распаковывается
+  утилитой `zstd` из PATH; нет её — пропуск с предупреждением в stderr.
   Каждая запись превращается в `Row` (`NamedTuple`): час, инструмент, модель,
   провайдер, агент, проект, 4 типа токенов. `collect()` — главная точка входа как
   библиотека, возвращает `list[Row]`.
