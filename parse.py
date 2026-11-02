@@ -22,6 +22,10 @@ parse.py — быстрый сбор расхода токенов из лока
   7. ZCode хранит расход не в jsonl, а в SQLite ~/.zcode/cli/db/db.sqlite, и его
      input_tokens ВКЛЮЧАЕТ обе части кэша — свежий input добывается вычитанием.
      started_at там в миллисекундах, а reasoning_tokens уже входит в output.
+  8. Codex сжимает старые rollout-логи zstd ДВУМЯ путями: на месте внутри
+     sessions/ и переносом в ~/.codex/archived_sessions/. Обычных .jsonl
+     остаются единицы: без обоих zst-глобов теряются месяцы (октябрь 2026 —
+     148 из 166 сессий лежали сжатыми в sessions/).
 
 Только stdlib, Python 3.9+.
 """
@@ -32,7 +36,9 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -44,6 +50,10 @@ from typing import Iterable, NamedTuple
 HOME = Path.home()
 CLAUDE_GLOB = str(HOME / ".claude/projects/**/*.jsonl")
 CODEX_GLOB = str(HOME / ".codex/sessions/**/rollout-*.jsonl")
+# Сжатые на месте rollout'ы (ловушка 8): их в 50 раз больше, чем обычных.
+CODEX_ZST_GLOB = str(HOME / ".codex/sessions/**/rollout-*.jsonl.zst")
+# Плюс плоский архив Codex: без обоих zst-глобов теряются целые месяцы.
+CODEX_ARCHIVE_GLOB = str(HOME / ".codex/archived_sessions/rollout-*.jsonl.zst")
 # ZCode — единственный источник-БД, а не набор файлов (ловушка 7). ZCODE_HOME
 # задаёт home-каталоги через запятую (так же, как в ccusage), путь к самой базе
 # внутри каждого из них фиксирован.
@@ -240,6 +250,26 @@ def _codex_agent(source: object, originator: str | None) -> str:
     return originator or "unknown"
 
 
+def _codex_open(path: str):
+    """Открыть лог Codex: обычный файл либо архив .jsonl.zst (ловушка 8) потоком
+    `zstd -dc`. Возвращает (текстовый поток, процесс-распаковщик | None). zstd в
+    stdlib Python нет (в 3.14 появится compression.zstd) — берём утилиту из PATH;
+    None означает «архив не читаем», коллектор в этом случае предупреждает сам."""
+    if not path.endswith(".zst"):
+        return open(path, errors="ignore"), None
+    exe = shutil.which("zstd")
+    if exe is None:
+        return None, None
+    proc = subprocess.Popen(
+        [exe, "-dc", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="ignore",
+    )
+    return proc.stdout, proc
+
+
 def parse_codex(path: str) -> list[Row]:
     """
     Воркер для одного rollout-*.jsonl.
@@ -254,7 +284,10 @@ def parse_codex(path: str) -> list[Row]:
     # сессия одна на весь файл — вычислить до цикла, а не на каждую строку.
     # Codex-сессия — это сам rollout-файл: layout ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl,
     # поэтому идентичность берём из имени файла (в нём UUID), а не из каталога (там год).
-    session = os.path.splitext(os.path.basename(path))[0]
+    name = os.path.basename(path)
+    if name.endswith(".jsonl.zst"):  # архив (ловушка 8) — снять оба расширения
+        name = name[: -len(".jsonl.zst")]
+    session = os.path.splitext(name)[0]
     cwd = "unknown"
     source: object = None
     originator: str | None = None
@@ -262,8 +295,10 @@ def parse_codex(path: str) -> list[Row]:
     provider = "unknown"
 
     try:
-        fh = open(path, errors="ignore")
+        fh, proc = _codex_open(path)
     except OSError:
+        return []
+    if fh is None:
         return []
 
     with fh:
@@ -274,6 +309,8 @@ def parse_codex(path: str) -> list[Row]:
                 try:
                     rec = json.loads(line)
                 except ValueError:
+                    continue
+                if not isinstance(rec, dict):
                     continue
                 if rec.get("type") == "session_meta":
                     p = rec.get("payload") or {}
@@ -289,6 +326,8 @@ def parse_codex(path: str) -> list[Row]:
                     rec = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 if rec.get("type") == "turn_context":
                     model = (rec.get("payload") or {}).get("model")
                 continue
@@ -298,6 +337,8 @@ def parse_codex(path: str) -> list[Row]:
             try:
                 rec = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(rec, dict):
                 continue
 
             payload = rec.get("payload") or {}
@@ -347,6 +388,10 @@ def parse_codex(path: str) -> list[Row]:
                     cache_read=cached,
                 )
             )
+
+    if proc is not None and proc.wait() != 0:
+        # обрыв посреди распаковки: тихо усечённый файл неотличим от честного
+        print(f"  codex {path}: zstd завершился с кодом {proc.returncode}, данные неполные", file=sys.stderr)
 
     return rows
 
@@ -457,7 +502,16 @@ def collect(
     if "claude" in tools:
         jobs.append((parse_claude, glob.glob(CLAUDE_GLOB, recursive=True)))
     if "codex" in tools:
-        jobs.append((parse_codex, glob.glob(CODEX_GLOB, recursive=True)))
+        files = glob.glob(CODEX_GLOB, recursive=True)
+        files += glob.glob(CODEX_ZST_GLOB, recursive=True)
+        archived = glob.glob(CODEX_ARCHIVE_GLOB)
+        if archived:
+            if shutil.which("zstd"):
+                files += archived
+            else:
+                # потеря данных должна шуметь: без zstd пропадают целые месяцы
+                print(f"  codex: zstd не найден — {len(archived)} архивных сессий пропущено", file=sys.stderr)
+        jobs.append((parse_codex, files))
 
     rows: list[Row] = []
     # ZCode мимо пула: это одна база на инструмент, распараллеливать нечего,

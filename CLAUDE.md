@@ -47,7 +47,11 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
 с `ccusage`.
 
 - **`parse.py`** — параллельный парсер (`ProcessPoolExecutor`, до 8 воркеров)
-  логов `~/.claude/projects/**/*.jsonl` и `~/.codex/sessions/**/rollout-*.jsonl`.
+  логов `~/.claude/projects/**/*.jsonl` и Codex-сессий в трёх глобах:
+  живые `~/.codex/sessions/**/rollout-*.jsonl`, сжатые на месте
+  `~/.codex/sessions/**/rollout-*.jsonl.zst` (их в разы больше — ловушка 15)
+  и архив `~/.codex/archived_sessions/rollout-*.jsonl.zst`. Zst распаковывается
+  утилитой `zstd` из PATH; нет её — пропуск с предупреждением в stderr.
   Каждая запись превращается в `Row` (`NamedTuple`): час, инструмент, модель,
   провайдер, агент, проект, 4 типа токенов. `collect()` — главная точка входа как
   библиотека, возвращает `list[Row]`.
@@ -74,6 +78,9 @@ CCUSAGE_BIN=~/Projects/ccusage/rust/target/release/ccusage \
   4. `$0` — только если нет цены в LiteLLM И `ccusage` стабильно (3+ дня)
      отдаёт ноль. Модель без прайса не считается бесплатной: её объём уходит
      в отдельную строку «без прайсинга», а не смешивается с `$0`.
+
+  `--refresh` не затирает кэш, а сливается с ним (ловушка 16): модели, выпавшие
+  из LiteLLM (`gpt-6-astra`), сохраняют старую ставку вместо потери прайса.
 
 - **`report.py`** — строит JSON-payload (`build_payload`, `build_dimension`)
   по пяти измерениям (`DIMENSIONS`: tool/model/provider/agent/project) и вшивает его
