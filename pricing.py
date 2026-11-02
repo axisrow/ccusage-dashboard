@@ -470,6 +470,11 @@ def main() -> None:
         # цена для неё в LiteLLM есть.
         seen = models_seen(collect())
         table = build(args.since, args.until, extra_models=seen)
+        # Refresh — обновление кэша, а не сброс: модель, выпавшая из LiteLLM
+        # (gpt-6-astra убрали из прайса), теряла старую ставку, и её расход
+        # уезжал в «без прайсинга». Пересчитанные модели перекрываются новыми.
+        for model, rates in load().items():
+            table.setdefault(model, rates)
         save(table)
         print(f"\nСохранено {len(table)} моделей в {CACHE.name}\n")
         describe(table)
